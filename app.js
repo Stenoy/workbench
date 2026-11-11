@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
    上岸工作台 - 主逻辑 v4
    紫白简约风 · 13页面 · 左侧纵向导航
    ============================================================ */
@@ -72,12 +72,12 @@ function loadData(){
     deletedBuiltin:{},      // 被删除的内置内容索引，按内容类型分类 {key:[index,...]}
     weakTargets:{},         // 薄弱考点自定义目标正确率 {key: percent}
     countTargets:{},        // 目标题量 {key: 题数}，与 durTargets 配对算出标准速度（分钟/题）
-    /* 课程（听课进度，只记讲数不记时间）：{id,name,teacher,section,total,note,createdAt,done:[{id,ts,date}]}
-       网课只记录听到了第几讲，不记时长——听课要搭配做题/笔记，真实学习时长用番茄钟更有意义 */
+    /* 课程（听课进度，只记讲数不记时间）：{id,name,teacher,section,total,note,createdAt,done:[{n,ts,date}]} n=第几讲；网课只记录听到了第几讲，不记时长——听课要搭配做题/笔记，真实学习时长用番茄钟更有意义 */
     courses:[],
     timetable:[],           // 课程表 [{id,name,period,time,module,repeat,weekday,date,createdAt}] 周历查看+月历安排，repeat=weekly每周固定/once仅这一天
     learnStage:{},          // 内容学习状态 {内容key:{条目key:'new'|'learning'|'mastered'}}，未学不存（省空间）
     setVolume:Object.assign({},DEFAULT_SET_VOLUME), // 「一组/一套」折多少题（按模块，可自己改）
+    weakTargetsMts:{},durTargetsMts:{},countTargetsMts:{}, // 目标值修改时间戳，用于多端 LWW 合并
     checkinHidden:[],       // 不参与打卡显示的分类（空 = 全部显示）
     pomo:{duration:25,custom:false,section:'yanyu',remaining:0,running:false,done:false,endAt:null,startTs:null,kind:'focus'} // 番茄钟进度（持久化：duration/custom/section/remaining/done/endAt/startTs/running/overtime/kind；review正计时用 startTs，focus/break倒计时用 endAt）。remaining 默认 0 = 没启动过就别显示浮窗
   };
@@ -104,6 +104,9 @@ function loadData(){
       deletedBuiltin:Object.assign({},saved.deletedBuiltin||{}),
       weakTargets:Object.assign({},saved.weakTargets||{}),
       countTargets:Object.assign({},saved.countTargets||{}),
+      weakTargetsMts:Object.assign({},saved.weakTargetsMts||{}),
+      durTargetsMts:Object.assign({},saved.durTargetsMts||{}),
+      countTargetsMts:Object.assign({},saved.countTargetsMts||{}),
       learnStage:(saved.learnStage&&typeof saved.learnStage==='object'&&!Array.isArray(saved.learnStage))?saved.learnStage:{},
       setVolume:Object.assign({},DEFAULT_SET_VOLUME,saved.setVolume||{}),
       checkinHidden:Array.isArray(saved.checkinHidden)?saved.checkinHidden:[],
@@ -121,6 +124,8 @@ function migrateTodos(){
   if(!state.durTargets)state.durTargets={};
   if(!state.countTargets)state.countTargets={};
   if(!Array.isArray(state.courses))state.courses=[];   // 课程（听课进度）
+  if(!Array.isArray(state.deletedTodoIds))state.deletedTodoIds=[]; // 跨设备删除同步：记录已删待办 id
+  migrateCourseDone();   // 老数据 done 仅计数 → 补上「第几讲」编号
   if(Array.isArray(state.todos)){
     // 数组形态：补齐缺失字段，丢弃无效项
     let changed=false;
@@ -584,17 +589,19 @@ function doPush(){
   var cfg=getSyncCfg();if(!cfg)return Promise.resolve();
   if(!navigator.onLine){setSyncStatus('offline');return Promise.resolve();}
   setSyncStatus('syncing');
-  var ts=Date.now();
-  return giteeWrite(cfg,JSON.stringify(syncPayloadTs(ts)))
-    .then(function(){
-      // 推送成功后，让"本地认为的云端状态"追上这次推送的时间，避免下次轮询误判"云端比自己新"而自己拉自己
-      state._syncTs=Math.max(state._syncTs||0,ts);
-      dirtySincePush=false; // 已成功推送，清除脏标记
-      bootPullPending=false; // 任一次成功推送即代表启动阶段已过，解除上传守卫
-      save(true);
-      setSyncStatus('ok','已同步 '+fmtTime(new Date()));
-    })
-    .catch(function(e){setSyncStatus('error',e.message);});
+  // 推送前先静默拉取合并云端最新，避免本端全量覆盖掉另一端刚推送的更改
+  // （doPull 内部已 save(true)，合并后的 state 才是要推送的真相）
+  return doPull(true).then(function(){
+    var ts=Date.now();
+    return giteeWrite(cfg,JSON.stringify(syncPayloadTs(ts)))
+      .then(function(){
+        state._syncTs=Math.max(state._syncTs||0,ts);
+        dirtySincePush=false;
+        bootPullPending=false;
+        save(true);
+        setSyncStatus('ok','已同步 '+fmtTime(new Date()));
+      });
+  }).catch(function(e){setSyncStatus('error',e.message);});
 }
 function syncPayloadTs(ts){
   var copy=JSON.parse(JSON.stringify(state));copy._syncTs=ts||Date.now();
@@ -636,14 +643,48 @@ function arrayUnionById(localArr,remoteArr){
   r.forEach(x=>{ if(x&&x.id!=null&&!idSet.has(x.id)){idSet.add(x.id);added.push(x);} });
   return l.concat(added);
 }
+/* 待办双向合并：① 按 id 并集；② 已存在项取 mts 较新者（最后修改者胜，保证两端收敛一致）；
+   ③ 删除同步：delSet 为「本地+远端删除 id 并集」，命中的项移除（一端删了另一端也删）；
+   ④ 课表自动生成的听课待办（autoTt）按 courseId@dueDate 去重，只留一条（优先确定性 id），
+   避免两设备各自生成一条重复 */
+function mergeTodosLWW(local,remote,delSet){
+  const map=new Map();
+  (Array.isArray(local)?local:[]).forEach(x=>{ if(x&&x.id!=null)map.set(x.id,x); });
+  (Array.isArray(remote)?remote:[]).forEach(x=>{
+    if(!x||x.id==null)return;
+    const ex=map.get(x.id);
+    if(!ex){ map.set(x.id,x); return; }
+    if((x.mts||0)>(ex.mts||0)) map.set(x.id,x); // 远端改得更晚 → 用远端
+  });
+  let arr=Array.from(map.values()).filter(x=>!(delSet&&delSet.has(x.id)));
+  const seen=new Map(), res=[];
+  arr.forEach(x=>{
+    if(x.autoTt&&x.courseId&&x.dueDate){
+      const key=x.courseId+'@'+x.dueDate, p=seen.get(key);
+      if(p){
+        const better=(String(x.id||'').indexOf('tt_')===0)?x:(String(p.id||'').indexOf('tt_')===0)?p:((x.mts||0)>=(p.mts||0)?x:p);
+        const i=res.findIndex(o=>o.id===p.id); if(i>=0)res[i]=better;
+        seen.set(key,better); return;
+      }
+      seen.set(key,x);
+    }
+    res.push(x);
+  });
+  return res;
+}
 function applyRemoteMerge(remote,remoteTs){
   if(!remote||typeof remote!=='object')return;
   const L=state,R=remote;
   const localHolds=function(o){return o&&typeof o==='object'&&!Array.isArray(o)&&Object.keys(o).length>0;};
-  // —— 待办（数组按 id 并集）——
-  if(Array.isArray(R.todos)&&R.todos.length){
-    const hadL=Array.isArray(L.todos)&&L.todos.length;
-    L.todos=arrayUnionById(L.todos,R.todos);
+  // —— 待办：双向 LWW（含删除同步 + autoTt 去重）——
+  {
+    const delSet=new Set();
+    (Array.isArray(L.deletedTodoIds)?L.deletedTodoIds:[]).forEach(id=>delSet.add(id));
+    (Array.isArray(R.deletedTodoIds)?R.deletedTodoIds:[]).forEach(id=>delSet.add(id));
+    if(Array.isArray(R.todos)||Array.isArray(L.todos)){
+      L.todos=mergeTodosLWW(L.todos,R.todos,delSet);
+    }
+    L.deletedTodoIds=Array.from(delSet);
   }
   // —— 学习记录 studyRecords：{date:{sessions:[]}}，date 并集、sessions 按 id 并集 ——
   if(localHolds(R.studyRecords)&&Object.keys(R.studyRecords).length){
@@ -656,7 +697,11 @@ function applyRemoteMerge(remote,remoteTs){
       if(typeof rd.focusCount==='number')ld.focusCount=Math.max(ld.focusCount||0,rd.focusCount);
     });
   }
-  // —— 每日统计 dailyStats：{date:{sec:{count,rate,subs}}}，date/sec 并集；同一 (date,sec) 本地已有则不覆盖（防重复累加）——
+  // —— 每日统计 dailyStats：{date:{sec:{count,rate,subs,records,minutes}}}
+  //   旧逻辑：同一 (date,sec) 本地已有则整块不覆盖 → 平板录的题手机当天有该模块空壳就合不进来。
+  //   新逻辑：date/sec 并集；同一 (date,sec) 把两端 records 按指纹(ts+sub+count)去重并集，
+  //   minutes 取两端较大值（records 可能被消费过导致 sum(min) 与 minutes 不一致，取 max 更安全），
+  //   最后 recomputeDailyStat 由合并后的 records 重算 count/rate/subs，保证汇总与明细对得上。 */
   if(localHolds(R.dailyStats)&&Object.keys(R.dailyStats).length){
     if(!localHolds(L.dailyStats))L.dailyStats={};
     Object.keys(R.dailyStats).forEach(function(d){
@@ -664,29 +709,109 @@ function applyRemoteMerge(remote,remoteTs){
       if(!L.dailyStats[d]||typeof L.dailyStats[d]!=='object')L.dailyStats[d]={};
       Object.keys(rd).forEach(function(sec){
         const rv=rd[sec];if(!rv||typeof rv!=='object')return;
-        if(L.dailyStats[d][sec]==null)L.dailyStats[d][sec]=rv; // 本地没有该模块统计才补
+        const lv=L.dailyStats[d][sec];
+        if(!lv){L.dailyStats[d][sec]=JSON.parse(JSON.stringify(rv));return;} // 本地没有该模块统计才补
+        // 本地已有：合并 records（按指纹去重，本地优先保留）
+        if(!Array.isArray(lv.records))seedRecordsIfLegacy(lv);
+        if(!Array.isArray(rv.records))seedRecordsIfLegacy(rv);
+        const lr=lv.records||[], rr=rv.records||[];
+        const fp=function(r){return (r.ts||0)+'|'+(r.sub||'__overall__')+'|'+(r.count||0);};
+        const seen=new Set(lr.map(fp));
+        rr.forEach(function(r){const f=fp(r);if(!seen.has(f)){seen.add(f);lr.push(JSON.parse(JSON.stringify(r)));}});
+        lv.records=lr;
+        // minutes 取两端较大值（records 被消费过的端 sum(min) 可能小于真实分钟数）
+        const lm=lv.minutes||0, rm=rv.minutes||0;
+        if(rm>lm)lv.minutes=rm;
+        if(lv.minutes<=0)delete lv.minutes;
+        recomputeDailyStat(sec,d);
+        if(!lv.records||!lv.records.length)delete L.dailyStats[d][sec];
       });
+      if(!Object.keys(L.dailyStats[d]).length)delete L.dailyStats[d];
     });
   }
-  // —— 套卷复盘 / 申论批改：数组按 id 并集 ——
-  if(Array.isArray(R.examRecords)&&R.examRecords.length)L.examRecords=arrayUnionById(L.examRecords||[],R.examRecords);
-  if(Array.isArray(R.shenlunReviews)&&R.shenlunReviews.length)L.shenlunReviews=arrayUnionById(L.shenlunReviews||[],R.shenlunReviews);
-  // —— 课程（听课进度）：数组按 id 并集 ——
-  if(Array.isArray(R.courses)&&R.courses.length)L.courses=arrayUnionById(L.courses||[],R.courses);
-  // —— 课表 timetable（按 id 并集，两端都保留）+ 生成日志 ttTodoLog（key 并集，远端补缺）——
-  if(Array.isArray(R.timetable)&&R.timetable.length)L.timetable=arrayUnionById(L.timetable||[],R.timetable);
+  // —— 套卷复盘 / 申论批改：按 id 并集，同 id 用 mts LWW（编辑过的版本覆盖旧版）——
+  function mergeByIdLWW(localArr,remoteArr){
+    if(!Array.isArray(localArr))localArr=[];
+    const lmap=new Map(localArr.map(x=>[x.id,x]));
+    (remoteArr||[]).forEach(function(r){
+      if(!r||r.id==null)return;
+      const l=lmap.get(r.id);
+      if(!l){localArr.push(JSON.parse(JSON.stringify(r)));lmap.set(r.id,r);return;}
+      const lm=l.mts||l.createdAt||0, rm=r.mts||r.createdAt||0;
+      if(rm>lm){Object.keys(l).forEach(function(k){delete l[k];});Object.assign(l,r);l.mts=r.mts||lm;}
+    });
+    return localArr;
+  }
+  if(Array.isArray(R.examRecords)&&R.examRecords.length)L.examRecords=mergeByIdLWW(L.examRecords,R.examRecords);
+  if(Array.isArray(R.shenlunReviews)&&R.shenlunReviews.length)L.shenlunReviews=mergeByIdLWW(L.shenlunReviews,R.shenlunReviews);
+  // —— 课程（听课进度）：按 id 并集；同 id 课程合并 done 数组（按 n 去重并集，两端听的讲数都保留）——
+  if(Array.isArray(R.courses)&&R.courses.length){
+    if(!Array.isArray(L.courses))L.courses=[];
+    const lmap=new Map(L.courses.map(c=>[c.id,c]));
+    R.courses.forEach(function(rc){
+      if(!rc||rc.id==null)return;
+      const lc=lmap.get(rc.id);
+      if(!lc){L.courses.push(JSON.parse(JSON.stringify(rc)));lmap.set(rc.id,rc);return;}
+      // 同 id 课程：合并 done（按 n 去重）、note 取较长者、total 取较大值
+      const ld=Array.isArray(lc.done)?lc.done:[], rd=Array.isArray(rc.done)?rc.done:[];
+      const nset=new Set(ld.map(d=>d&&d.n));
+      rd.forEach(function(d){if(d&&d.n!=null&&!nset.has(d.n)){nset.add(d.n);ld.push(d);}});
+      lc.done=ld;
+      if(rc.total&&(!lc.total||rc.total>lc.total))lc.total=rc.total;
+      if(rc.note&&(!lc.note||rc.note.length>lc.note.length))lc.note=rc.note;
+    });
+  }
+  // —— 课表 timetable：按 id 并集，同 id 用 mts LWW（改期/换课等编辑能同步）——
+  if(Array.isArray(R.timetable)&&R.timetable.length)L.timetable=mergeByIdLWW(L.timetable,R.timetable);
+  // ttTodoLog：key 并集，远端补缺
   if(R.ttTodoLog&&typeof R.ttTodoLog==='object'&&!Array.isArray(R.ttTodoLog)){
     if(!L.ttTodoLog||typeof L.ttTodoLog!=='object'||Array.isArray(L.ttTodoLog))L.ttTodoLog={};
     Object.keys(R.ttTodoLog).forEach(function(k){ if(L.ttTodoLog[k]==null)L.ttTodoLog[k]=R.ttTodoLog[k]; });
   }
-  // —— summaries {date:text}、periodReviews {key:{...}}、weakTargets、durTargets、deletedBuiltin：key 并集，远端补缺 ——
-  ['summaries','periodReviews','weakTargets','durTargets','countTargets','deletedBuiltin','checkinHidden'].forEach(function(k){
+  // —— summaries {date:text}：无 per-key 时间戳，按 payload 时间戳 LWW（远端更新则取远端值）——
+  (function(){
+    const rv=R.summaries;
+    if(!rv||typeof rv!=='object'||Array.isArray(rv))return;
+    if(!L.summaries||typeof L.summaries!=='object'||Array.isArray(L.summaries))L.summaries={};
+    const remoteNewer=remoteTs>(state._syncTs||0);
+    Object.keys(rv).forEach(function(key){ if(L.summaries[key]==null||remoteNewer)L.summaries[key]=rv[key]; });
+  })();
+  // —— periodReviews {key:{text,ts}}：按 ts LWW ——
+  (function(){
+    const rv=R.periodReviews;
+    if(!rv||typeof rv!=='object'||Array.isArray(rv))return;
+    if(!L.periodReviews||typeof L.periodReviews!=='object'||Array.isArray(L.periodReviews))L.periodReviews={};
+    Object.keys(rv).forEach(function(key){
+      const lv=L.periodReviews[key], rem=rv[key];
+      if(lv==null){L.periodReviews[key]=rem;return;}
+      const lt=(lv&&lv.ts)||0, rt=(rem&&rem.ts)||0;
+      if(rt>lt)L.periodReviews[key]=JSON.parse(JSON.stringify(rem));
+    });
+  })();
+  // —— weakTargets / durTargets / countTargets：按对应 *Mts 做 per-key LWW ——
+  (function(){
+    const pairs=[['weakTargets','weakTargetsMts'],['durTargets','durTargetsMts'],['countTargets','countTargetsMts']];
+    pairs.forEach(function(p){
+      const vk=p[0], mk=p[1];
+      const rv=R[vk]; if(!rv||typeof rv!=='object'||Array.isArray(rv))return;
+      if(!L[vk]||typeof L[vk]!=='object'||Array.isArray(L[vk]))L[vk]={};
+      if(!L[mk]||typeof L[mk]!=='object')L[mk]={};
+      const rmts=R[mk]||{};
+      Object.keys(rv).forEach(function(key){
+        const lv=L[vk][key], lm=L[mk][key]||0, rm=rmts[key]||0;
+        if(lv==null){L[vk][key]=rv[key];L[mk][key]=rm;}
+        else if(rm>lm){L[vk][key]=rv[key];L[mk][key]=rm;}
+      });
+    });
+  })();
+  // —— deletedBuiltin / checkinHidden：key 并集，远端补缺 ——
+  ['deletedBuiltin','checkinHidden'].forEach(function(k){
     const rv=R[k];
     if(!rv||typeof rv!=='object'||Array.isArray(rv))return;
     if(!L[k]||typeof L[k]!=='object'||Array.isArray(L[k]))L[k]={};
     Object.keys(rv).forEach(function(key){ if(L[k][key]==null)L[k][key]=rv[key]; });
   });
-  // —— learnStage {内容key:{条目key:stage}}：两层并集，远端补缺（本地优先，与主流程一致） ——
+  // —— learnStage {内容key:{条目key:{s,n,r,t,w}}}：两层并集，同条目按 t LWW ——
   (function(){
     const rv=R.learnStage;
     if(!rv||typeof rv!=='object'||Array.isArray(rv))return;
@@ -694,9 +819,30 @@ function applyRemoteMerge(remote,remoteTs){
     Object.keys(rv).forEach(function(ck){
       const rm=rv[ck];if(!rm||typeof rm!=='object')return;
       if(!L.learnStage[ck]||typeof L.learnStage[ck]!=='object')L.learnStage[ck]={};
-      Object.keys(rm).forEach(function(ik){ if(L.learnStage[ck][ik]==null)L.learnStage[ck][ik]=rm[ik]; });
+      Object.keys(rm).forEach(function(ik){
+        const lv=L.learnStage[ck][ik], rem=rm[ik];
+        if(lv==null){L.learnStage[ck][ik]=rem;return;}
+        const lt=(lv&&lv.t)||0, rt=(rem&&rem.t)||0;
+        if(rt>lt)L.learnStage[ck][ik]=JSON.parse(JSON.stringify(rem));
+      });
     });
   })();
+  // —— userProfile / setVolume / examDates：之前完全没合并，昵称/头像/考试日期/题量折算都不同步 ——
+  if(R.userProfile&&typeof R.userProfile==='object'&&!Array.isArray(R.userProfile)){
+    if(!L.userProfile)L.userProfile={};
+    const remoteNewer=remoteTs>(state._syncTs||0);
+    Object.keys(R.userProfile).forEach(function(k){ if(L.userProfile[k]==null||remoteNewer)L.userProfile[k]=R.userProfile[k]; });
+  }
+  if(R.setVolume&&typeof R.setVolume==='object'&&!Array.isArray(R.setVolume)){
+    if(!L.setVolume)L.setVolume={};
+    const remoteNewer=remoteTs>(state._syncTs||0);
+    Object.keys(R.setVolume).forEach(function(k){ if(L.setVolume[k]==null||remoteNewer)L.setVolume[k]=R.setVolume[k]; });
+  }
+  if(R.examDates&&typeof R.examDates==='object'&&!Array.isArray(R.examDates)){
+    if(!L.examDates)L.examDates={};
+    const remoteNewer=remoteTs>(state._syncTs||0);
+    Object.keys(R.examDates).forEach(function(k){ if(L.examDates[k]==null||remoteNewer)L.examDates[k]=R.examDates[k]; });
+  }
   // —— customData 各数组：按 id 并集 ——
   if(R.customData&&typeof R.customData==='object'){
     if(!L.customData||typeof L.customData!=='object')L.customData={};
@@ -1579,14 +1725,14 @@ function syncTimetableTodos(silent){
     const dup=(state.todos||[]).some(td=>td&&td.courseId===course.id&&td.dueDate===t);
     state.ttTodoLog[k]=Date.now();
     if(dup)return;
-    const next=learned+1;
+    const next=nextLessonNum(course);
     (state.todos=state.todos||[]).push({
-      id:uid(),
+      id:'tt_'+c.id+'_'+t,
       text:c.name+' 第'+next+'讲',
       dueDate:t,
       section:course.section||c.module||'',
       sub:'', count:0, repeat:'', jumpType:'course', courseId:course.id,
-      done:false, ts:Date.now(), autoTt:c.id
+      done:false, ts:Date.now(), mts:Date.now(), autoTt:c.id
     });
     made++;
   });
@@ -1596,30 +1742,12 @@ function syncTimetableTodos(silent){
   if(made&&!silent)toast('已为今天 '+made+' 节课生成听课待办');
   return made;
 }
-/* 时间段开始分钟数："19:00-21:00 / 19：00~21：00" 都能解析，解析不了排最后 */
-function ttStartMin(t){const m=String(t||'').match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);return m?(+m[1]*60+ +m[2]):9999;}
-/* 格内/当天课程按开始时间排序，同时段按创建先后 */
-function ttSort(list){return (list||[]).slice().sort((a,b)=>ttStartMin(a.time)-ttStartMin(b.time)||(a.createdAt||0)-(b.createdAt||0));}
-/* 只取时间段的开始时刻，小格子里显示更短 */
+/* 格内/当天课程按创建先后排序（同一门课一天可加多节，按添加顺序排） */
+function ttSort(list){return (list||[]).slice().sort((a,b)=>(a.createdAt||0)-(b.createdAt||0));}
 /* 当前查看的是第几周（相对本周）：0=本周 -1=上周 1=下周，其他返回 null */
 function ttWeekOffset(ws){
   const w=Math.round((ws.getTime()-ttWeekStart(new Date()).getTime())/604800000);
   return (w>=-2&&w<=2&&w!==0)?w:(w===0?0:null);
-}
-/* 同名课程同一天重复拦截（weekly 同星期几 / once 同日期）。不同名课程同一天可并存。excludeId=编辑时排除自身 */
-function ttConflict(slot,excludeId){
-  // 同名课程在同一天（weekly 同星期几 / once 同日期）视为重复，防止手滑加两遍；不同名的课同一天可并存
-  return (state.timetable||[]).find(c=>{
-    if(!c||c.id===excludeId||!c.name)return false;
-    if(c.name.trim()!==String(slot.name||'').trim())return false;
-    if(slot.repeat==='once'){
-      if(c.repeat==='once')return c.date===slot.date;
-      return c.weekday===slot.weekday;
-    }
-    if(c.repeat==='weekly')return c.weekday===slot.weekday;
-    if(c.repeat==='once'&&c.date)return new Date(c.date+'T00:00:00').getDay()===slot.weekday;
-    return false;
-  })||null;
 }
 function renderTimetableCard(pane){
   const card=el('div','card tt-card');
@@ -1831,9 +1959,7 @@ function openTimetableEdit(weekday,dateStr,id,keepDay){
     const repeat=rEl?rEl.dataset.v:'weekly';
     const module=document.getElementById('ttModule').value;
     const courseId=document.getElementById('ttCourse').value||'';
-    // 同名课程同一天重复拦截（防止手滑；不同名课程一天可并存）
-    const conf=ttConflict({repeat:repeat,weekday:weekday,date:dateStr,name:name},isEdit?id:null);
-    if(conf){toast('这一天已有「'+conf.name+'」了，换个课程名或先改它');return;}
+    // 同一门课程一天可加多节（听多讲），不再做同名同日拦截
     if(!state.timetable)state.timetable=[];
     if(isEdit){
       const c=state.timetable.find(x=>x&&x.id===id);
@@ -1850,8 +1976,9 @@ function openTimetableEdit(weekday,dateStr,id,keepDay){
         }
         c.name=name;c.module=module;c.repeat=repeat;c.weekday=weekday;c.courseId=courseId||undefined;if(repeat==='once')c.date=dateStr;else delete c.date;
       }
+      item.mts=Date.now();
     }else{
-      state.timetable.push({id:uid(),name,module,repeat,weekday,date:repeat==='once'?dateStr:undefined,createdAt:Date.now(),courseId:courseId||undefined});
+      state.timetable.push({id:uid(),name,module,repeat,weekday,date:repeat==='once'?dateStr:undefined,createdAt:Date.now(),mts:Date.now(),courseId:courseId||undefined});
     }
     save();
     /* 先静默同步拿生成数，合并进「课程已添加」一条提示，避免两条 toast 互相覆盖 */
@@ -1898,43 +2025,153 @@ function renderBrush(pane){
    听完一讲只记进度、不记时间（听课要搭配做题/笔记，真实时长用番茄钟更有意义）。
    ============================================================ */
 function findCourse(id){ return (Array.isArray(state.courses)?state.courses:[]).filter(function(c){return c&&c.id===id;})[0]||null; }
-/* 听完一讲：只记进度，不记时间。听课要搭配做题/笔记，真实时长用番茄钟更有意义，这里不掺时间 */
+/* 迁移：老数据 done 是 [{id,ts,date}] 纯计数，没有「第几讲」编号。
+   补成 [{n,ts,date}]：旧数据按顺序补 1..k；已带 n 的保留；同号去重 */
+function migrateCourseDone(){
+  (state.courses||[]).forEach(function(c){
+    if(!c)return;
+    if(!Array.isArray(c.done)){c.done=[];return;}
+    if(c.done.length && c.done.every(function(d){return d&&typeof d.n!=='number';})){
+      c.done=c.done.map(function(d,i){return {n:i+1,ts:d.ts||Date.now(),date:d.date||todayStr()};});
+    }
+    c.done.forEach(function(d,i){ if(d&&typeof d.n!=='number')d.n=i+1; });
+    const seen={}; c.done=c.done.filter(function(d){ if(!d||seen[d.n])return false; seen[d.n]=1; return true; });
+  });
+}
+/* 该课程已听完的讲号集合 */
+function courseDoneSet(c){ return new Set((c.done||[]).map(function(d){return d.n;}).filter(function(n){return typeof n==='number';})); }
+/* 下一讲未听（最小未听编号）；全听完返回 total+1（或已听数+1） */
+function nextLessonNum(c){
+  const tt=+c.total||0; const set=courseDoneSet(c);
+  for(let i=1;i<=(tt||(set.size+1));i++){ if(!set.has(i))return i; }
+  return (tt||set.size)+1;
+}
+/* 标记/取消某讲：点格子切换。cellEl 用于就地更新 UI（避免整页重渲染丢滚动） */
+function toggleLesson(id,n,cellEl){
+  const c=findCourse(id); if(!c)return;
+  if(!Array.isArray(c.done))c.done=[];
+  const set=courseDoneSet(c);
+  const item=cellEl?cellEl.closest('.course-item'):null;
+  const d=todayStr();
+  if(set.has(n)){
+    c.done=c.done.filter(x=>x.n!==n);
+    save();
+    if(cellEl)cellEl.classList.remove('on');
+    toast('已取消「'+c.name+'」第 '+n+' 讲');
+  }else{
+    c.done.push({n:n,ts:Date.now(),date:d});
+    save();
+    if(cellEl)cellEl.classList.add('on');
+    toast('已标记「'+c.name+'」第 '+n+' 讲');
+    syncTodoForLesson(c,n);
+    if(c.total&&c.done.length>=c.total){
+      const before=(state.todos||[]).length;
+      state.todos=(state.todos||[]).filter(td=>!(td&&!td.done&&td.jumpType==='course'&&td.autoTt&&td.courseId===c.id));
+      if((state.todos||[]).length<before){save();setTimeout(()=>toast('课程已结课，自动听课待办已清理'),800);}
+    }
+    if(c.type==='brush')promptBrushIfNeeded(c);
+  }
+  const tt=+c.total||0, done=c.done.length;
+  const pct=tt?Math.min(100,Math.round(done/tt*100)):(done?100:0);
+  if(item){
+    const bar=item.querySelector('.course-bar i'); if(bar)bar.style.width=pct+'%';
+    const meta=item.querySelector('.course-meta'); if(meta)meta.innerHTML='<span>已听 <b>'+done+'</b>'+(tt?(' / '+tt):'')+' 讲'+(tt?('（'+pct+'%）'):'')+'</span>';
+    item.classList.toggle('course-done', tt>0&&done>=tt);
+    let tag=item.querySelector('.course-finish-tag');
+    if(tt>0&&done>=tt){ if(!tag){const nm=item.querySelector('.course-name'); const t=document.createElement('span');t.className='course-finish-tag';t.textContent='已结课';nm.appendChild(t);} }
+    else if(tag){tag.remove();}
+    const undoBtn=item.querySelector('.course-undo'); if(undoBtn)undoBtn.style.display=done?'':'none';
+    const lc=item.querySelector('.lesson-count'); if(lc)lc.textContent=(c.done?c.done.length:0)+'/'+(+c.total||0);
+  }
+}
+/* 讲义弹窗：显示全部讲次格子，可跳着标（点哪讲标哪讲，再点取消）；含「撤销最近一讲」 */
+function openLessonsModal(c){
+  const tt=+c.total||0; if(tt<=0){toast('该课程没设总讲数，无法显示讲义格');return;}
+  const set=courseDoneSet(c);
+  let cells='';
+  for(let n=1;n<=tt;n++){ cells+='<button type="button" class="les-cell'+(set.has(n)?' on':'')+'" data-n="'+n+'">'+n+'</button>'; }
+  const body='<div class="les-modal-head"><span class="les-modal-count" id="lesModalCount">已听 '+(c.done?c.done.length:0)+'/'+tt+'</span>'
+    +'<button type="button" class="btn btn-ghost les-modal-undo" id="lesModalUndo">撤销最近一讲</button></div>'
+    +'<div class="lesson-grid les-modal-grid" id="lesModalGrid">'+cells+'</div>';
+  openModal('讲义 · '+c.name, body);
+  const box=$('#modalBody'); if(!box)return;
+  box.querySelectorAll('.les-cell').forEach(function(cell){
+    cell.addEventListener('click',function(){
+      const n=parseInt(cell.dataset.n,10);
+      const wasOn=set.has(n);
+      toggleLesson(c.id,n,null);
+      const cnt=(findCourse(c.id).done||[]).length;
+      const cc=box.querySelector('#lesModalCount'); if(cc)cc.textContent='已听 '+cnt+'/'+tt;
+      cell.classList.toggle('on',!wasOn);
+      refreshCourseCardDOM(c.id);
+    });
+  });
+  const undoBtn=box.querySelector('#lesModalUndo');
+  if(undoBtn)undoBtn.addEventListener('click',function(){
+    const cur=findCourse(c.id); if(!cur||!(cur.done||[]).length){toast('没有可撤销的讲次');return;}
+    const last=cur.done.reduce(function(a,x){return (x.n>a.n?x:a);},{n:0});
+    toggleLesson(cur.id,last.n,null);
+    const cnt=(findCourse(c.id).done||[]).length;
+    const cc=box.querySelector('#lesModalCount'); if(cc)cc.textContent='已听 '+cnt+'/'+tt;
+    const uc=box.querySelector('.les-cell[data-n="'+last.n+'"]'); if(uc)uc.classList.remove('on');
+    refreshCourseCardDOM(c.id);
+  });
+}
+/* 讲义弹窗里改完，就地刷新对应课程卡（进度条/已听数/讲义按钮计数/结课态），不整页重渲染 */
+function refreshCourseCardDOM(cid){
+  const item=document.querySelector('.course-item[data-cid="'+cid+'"]'); if(!item)return;
+  const c=findCourse(cid); if(!c)return;
+  const tt=+c.total||0, done=(c.done||[]).length;
+  const pct=tt?Math.min(100,Math.round(done/tt*100)):(done?100:0);
+  const bar=item.querySelector('.course-bar i'); if(bar)bar.style.width=pct+'%';
+  const meta=item.querySelector('.course-meta'); if(meta)meta.innerHTML='<span>已听 <b>'+done+'</b>'+(tt?(' / '+tt):'')+' 讲'+(tt?('（'+pct+'%）'):'')+'</span>';
+  item.classList.toggle('course-done', tt>0&&done>=tt);
+  let tag=item.querySelector('.course-finish-tag');
+  if(tt>0&&done>=tt){ if(!tag){const nm=item.querySelector('.course-name'); const t=document.createElement('span');t.className='course-finish-tag';t.textContent='已结课';nm.appendChild(t);} }
+  else if(tag){tag.remove();}
+  const lb=item.querySelector('.course-lessons'); if(lb)lb.textContent='讲义 '+done+(tt?('/'+tt):'');
+  const nb=item.querySelector('.course-next');
+  if(nb){
+    if(tt>0&&done>=tt){nb.disabled=true;nb.textContent='已听完 '+tt+' 讲 ✓';nb.style.opacity='.5';nb.style.cursor='default';}
+    else {nb.disabled=false;nb.style.opacity='';nb.style.cursor='';}
+  }
+}
+/* 同步「第 n 讲」待办为完成 */
+function syncTodoForLesson(c,n){
+  if(!Array.isArray(state.todos))return;
+  const matched=state.todos.find(td=>{
+    if(!td||td.done||td.jumpType!=='course')return false;
+    if(td.courseId)return td.courseId===c.id;
+    const txt=td.text||'';
+    return txt.includes(c.name)&&new RegExp('第\\s*'+n+'\\s*讲').test(txt);
+  });
+  if(matched){
+    if(isRepeat(matched)){matched.lastDone=todayStr();matched.doneCount=(matched.doneCount||0)+1;}
+    else matched.done=true;
+    markTodoModified(matched);
+    save();
+    setTimeout(()=>toast('同步完成待办：'+matched.text),600);
+  }
+}
+/* 听完一讲：仅用于「未设总讲数」的课程（无格子可点时的兜底 +1） */
 function finishLesson(id){
   const c=findCourse(id); if(!c)return;
   const d=todayStr();
   if(!Array.isArray(c.done))c.done=[];
-  /* 总讲数上限：已听完不再追加（课程页按钮此时应已置灰，这里是双保险） */
-  if(c.total&&c.done.length>=c.total){toast(c.name+' 已全部听完（共 '+c.total+' 讲）');return;}
-  c.done.push({id:uid(),ts:Date.now(),date:d});
+  const tt=+c.total||0;
+  const n=c.done.length+1;
+  if(tt&&n>tt){toast(c.name+' 已全部听完（共 '+tt+' 讲）');return;}
+  c.done.push({n:n,ts:Date.now(),date:d});
   save();
-  const n=c.done.length,tt=c.total||0;
   toast('已听完 '+c.name+' 第 '+n+' 讲'+(tt?('（共 '+tt+' 讲）'):''));
-  // 同步完成匹配的待办：优先 courseId 精准匹配（改名不断链）；
-  // 无 courseId 的老待办回退文本匹配：文本包含课程名和"第N讲"，且N等于当前听完的讲数
-  if(Array.isArray(state.todos)){
-    const matched=state.todos.find(td=>{
-      if(!td||td.done||td.jumpType!=='course')return false;
-      if(td.courseId)return td.courseId===c.id;
-      const txt=td.text||'';
-      return txt.includes(c.name)&&new RegExp('第\\s*'+n+'\\s*讲').test(txt);
-    });
-    if(matched){
-      if(isRepeat(matched)){matched.lastDone=d;matched.doneCount=(matched.doneCount||0)+1;}
-      else matched.done=true;
-      save();
-      setTimeout(()=>toast('同步完成待办：'+matched.text),600);
-    }
-    /* 听满总讲数=结课：回收课表自动生成但还没勾的听课待办（手动加的保留，用户自己处理）。
-       课表侧 ttDayCourses 也会自动停排，这里收掉待办尾巴 */
-    if(c.total&&c.done.length>=c.total){
-      const before=state.todos.length;
-      state.todos=state.todos.filter(td=>!(td&&!td.done&&td.jumpType==='course'&&td.autoTt&&td.courseId===c.id));
-      if(state.todos.length<before){save();setTimeout(()=>toast('课程已结课，自动听课待办已清理'),1200);}
-    }
+  syncTodoForLesson(c,n);
+  if(tt&&c.done.length>=tt){
+    const before=(state.todos||[]).length;
+    state.todos=(state.todos||[]).filter(td=>!(td&&!td.done&&td.jumpType==='course'&&td.autoTt&&td.courseId===c.id));
+    if((state.todos||[]).length<before){save();setTimeout(()=>toast('课程已结课，自动听课待办已清理'),1200);}
   }
   render();
-  // 刷题课：听完一讲后让用户自己选择是否录入本次刷题成绩（听课课不弹）
-  promptBrushIfNeeded(c);
+  if(c.type==='brush')promptBrushIfNeeded(c);
 }
 /* 刷题课听完一讲后，统一弹出「本次有刷题？」选择录入成绩或跳过。
    课程页点「上完一课」与勾选「听一讲」网课待办两条路径共用，保证行为一致 */
@@ -1949,7 +2186,7 @@ function promptBrushIfNeeded(c){
 /* 刷题课听完一讲后：弹出「本次有刷题？」选择录入成绩或跳过 */
 function askBrushRecord(c){
   openModal('本次有刷题吗？',
-    `<p style="margin:0 0 14px;color:var(--text-sub);font-size:13px;line-height:1.6;">「${escapeHtml(c.name)}」第 ${(c.done?c.done.length:1)} 讲是<b>刷题课</b>，要不要记录本次刷题成绩？录了会并进「${SECTION_MAP[c.section].name}」的正确率统计。</p>
+    `<p style="margin:0 0 14px;color:var(--text-sub);font-size:13px;line-height:1.6;">「${escapeHtml(c.name)}」第 ${((c.done&&c.done.length)?(c.done[c.done.length-1].n||c.done.length):1)} 讲是<b>刷题课</b>，要不要记录本次刷题成绩？录了会并进「${SECTION_MAP[c.section].name}」的正确率统计。</p>
      <div class="dlg-actions"><button class="btn btn-ghost" id="lesSkip">跳过</button><button class="btn" id="lesRecord">录入成绩</button></div>`);
   const box=$('#modalBody'); if(!box)return;
   box.querySelector('#lesSkip').onclick=closeModal;
@@ -1978,16 +2215,20 @@ function syncCourseProgressByTodo(td){
   if(c.total&&n>c.total)n=c.total;
   if(!Array.isArray(c.done))c.done=[];
   let added=0;
-  while(c.done.length<n){c.done.push({id:uid(),ts:Date.now(),date:todayStr()});added++;}
+  /* 精确标记第 n 讲（支持跳着听：只标这一讲，不强制补 1..n）。已标过则幂等不重复 */
+  if(!courseDoneSet(c).has(n)){ c.done.push({n:n,ts:Date.now(),date:todayStr()}); added=1; }
   // 刷题课：勾选待办自动听完一讲后，同样让用户选择是否录入本次刷题成绩（与课程页「上完一课」一致）
   if(added>0)promptBrushIfNeeded(c);
   return added;
 }
-/* 撤销上一讲：进度 -1 */
+/* 撤销上一讲：移除最近完成的一讲（按时间最新的那讲，而非数组末尾） */
 function undoLesson(id){
   const c=findCourse(id); if(!c||!Array.isArray(c.done)||!c.done.length)return;
-  c.done.pop();
-  save();toast('已撤销「'+c.name+'」第 '+(c.done.length+1)+' 讲');render();
+  let idx=0,max=-1;
+  c.done.forEach(function(d,i){ if((d.ts||0)>max){max=d.ts||0;idx=i;} });
+  const removed=c.done[idx];
+  c.done.splice(idx,1);
+  save();toast('已撤销「'+c.name+'」第 '+((removed&&removed.n)?removed.n:(c.done.length+1))+' 讲');render();
 }
 /* 添加 / 编辑课程 */
 function courseFormModal(id){
@@ -2051,7 +2292,7 @@ function renderCourses(pane){
   const totalDone=list.reduce(function(a,c){return a+((c.done||[]).length);},0);
   const totalTarget=list.reduce(function(a,c){return a+((c.total||0));},0);
   card.innerHTML=`<div class="section-title"><span class="dot"></span>我的课程${list.length?`<span class="slr-count">${list.length} 门</span>`:''}
-      ${hmark('听完一讲点「听完一讲」就行。课程只记进度、不记时间——听课要搭配做题和笔记，真实学习时长用番茄钟更有意义。')}</div>
+      ${hmark('课程卡底部「听完下一讲」按顺序勾选；点「讲义」弹出全部讲次格子可跳着标（再点取消）。只记进度不记时间——真实学习时长用番茄钟更有意义。')}</div>
     <div class="course-tip">${list.length?('已听完 '+totalDone+' 讲'+(totalTarget>0?(' · 目标共 '+totalTarget+' 讲'):'')):''}</div>
     <div class="course-add"><button class="btn" id="courseAddBtn">+ 添加课程</button></div>
     <div id="courseList"></div>`;
@@ -2070,16 +2311,34 @@ function renderCourses(pane){
   sorted.forEach(function(c){
     const done=(c.done||[]).length,tt=+c.total||0;
     const pct=tt?Math.min(100,Math.round(done/tt*100)):(done?100:0);
-    const full=tt>0&&done>=tt;   // 已听满总讲数：按钮置灰，不再允许 +1
+    const full=tt>0&&done>=tt;   // 已听满总讲数
     const sec=c.section?(SECTION_MAP[c.section]||{}):null;
     const item=el('div','course-item'+(full?' course-done':''));
+    item.dataset.cid=c.id;
+    // 底部两按钮：大额「听完下一讲」（按顺序勾选）+ 右侧小「讲义」弹出全部讲次格子；未设总讲数回退老按钮
+    let btnsHtml;
+    if(tt>0){
+      btnsHtml='<div class="course-btns">'
+        + (full
+            ? '<button type="button" class="btn course-next" disabled style="opacity:.5;cursor:default;">已听完 '+tt+' 讲 ✓</button>'
+            : '<button type="button" class="btn course-next" data-act="next">'+(c.type==='brush'?'上完下一课 ✓':'听完下一讲 ✓')+'</button>')
+        + '<button type="button" class="btn btn-ghost course-lessons" data-act="lessons">讲义 '+(c.done?c.done.length:0)+(tt?('/'+tt):'')+'</button>'
+        + '</div>';
+    } else {
+      btnsHtml='<div class="course-btns">'
+        + (full
+            ? '<button class="btn course-finish" disabled style="opacity:.5;cursor:default;">已听完 '+(c.done?c.done.length:0)+' 讲 ✓</button>'
+            : '<button type="button" class="btn course-finish" data-act="finish">'+(c.type==='brush'?'上完一课 ✓':'听完一讲 ✓')+'</button>'
+              + ((c.done||[]).length?'<button type="button" class="btn btn-ghost course-undo" data-act="undo">撤销</button>':''))
+        + '</div>';
+    }
     item.innerHTML=`
       <div class="course-head">
         <div class="course-name">${escapeHtml(c.name)}${full?'<span class="course-finish-tag">已结课</span>':''}</div>
         <div class="course-acts">
-          <button class="icon-btn" data-act="addtodo" aria-label="加入待办" title="加入待办">${icon('plus')}</button>
-          <button class="icon-btn" data-act="edit" aria-label="编辑">${icon('edit')}</button>
-          <button class="icon-btn" data-act="del" aria-label="删除">${icon('trash')}</button>
+          <button type="button" class="icon-btn" data-act="addtodo" aria-label="加入待办" title="加入待办">${icon('plus')}</button>
+          <button type="button" class="icon-btn" data-act="edit" aria-label="编辑">${icon('edit')}</button>
+          <button type="button" class="icon-btn" data-act="del" aria-label="删除">${icon('trash')}</button>
         </div>
       </div>
       <div class="course-sub">
@@ -2089,21 +2348,18 @@ function renderCourses(pane){
       </div>
       <div class="course-bar"><i style="width:${pct}%"></i></div>
       <div class="course-meta"><span>已听 <b>${done}</b>${tt?(' / '+tt):''} 讲${tt?('（'+pct+'%）'):''}</span></div>
-      <div class="course-btns">
-        ${full?`<button class="btn course-finish" disabled style="opacity:.5;cursor:default;">已听完 ${tt} 讲 ✓</button>`
-             :`<button class="btn course-finish" data-act="finish">${c.type==='brush'?'上完一课 ✓':'听完一讲 ✓'}</button>`}
-        ${done?`<button class="btn btn-ghost course-undo" data-act="undo">撤销</button>`:''}
-      </div>`;
+      ${btnsHtml}`;
     item.addEventListener('click',function(e){
       const b=e.target.closest?e.target.closest('[data-act]'):null; if(!b)return;
       const act=b.dataset.act;
-      if(act==='finish')finishLesson(c.id);
+      if(act==='next'||act==='finish')finishLesson(c.id);
+      else if(act==='lessons')openLessonsModal(c);
       else if(act==='undo')undoLesson(c.id);
       else if(act==='edit')courseFormModal(c.id);
       else if(act==='del')deleteCourse(c.id);
       else if(act==='addtodo'){
         if(full){toast(c.name+' 已全部听完，不用再加听课待办了');return;}
-        const nextLesson=(c.done?c.done.length:0)+1;
+        const nextLesson=nextLessonNum(c);
         openTodoEditor(null,null,{text:c.name+' 第'+nextLesson+'讲',jumpType:'course',section:c.section||'',courseId:c.id});
       }
     });
@@ -2599,6 +2855,7 @@ function initPomoFloat(){
               if(_nt.dueDate&&_nt.dueDate.length)_nt.dueDate=nextRepeatDate(_nt.repeat,_td0);
             }
           }else{_nt.done=true;_nt.lastDone=_td0;}
+          markTodoModified(_nt);
           _noteDoneTxt=' ·「'+(_nt.text.length>12?_nt.text.slice(0,12)+'…':_nt.text)+'」已打勾';
         }
       }
@@ -4193,6 +4450,25 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   const title=(t.sub?subName(t.sub):SECTION_MAP[t.sec].name);
   const isSplit=!t.sub && splitSubEntries(t.sec).length>0;
   const sv=(stat.subs&&stat.subs[t.sub])||{count:0,rate:0};
+  /* 关联待办题量预填：任务关联了子模块/大类并设了题量时，录成绩自动带入（可改，不锁定）。
+     收集规则：同 sec、未 done、非「重复任务今天已打勾」的待办；子模块待办按 subName 存（待办 sub 是「言语_逻辑填空」，
+     拆分行 key 是「逻辑填空」，统一用 subName 桥接），整体待办存 __overall__。 */
+  const _todoCountByName={};
+  (state.todos||[]).forEach(_p=>{
+    if(_p.section===t.sec && _p.count>0 && !_p.done && !(isRepeat(_p)&&_p.lastDone===todayStr())){
+      if(_p.sub){const _nm=subName(_p.sub);if(_nm)_todoCountByName[_nm]=_p.count;}
+      else if(_todoCountByName['__overall__']==null)_todoCountByName['__overall__']=_p.count;
+    }
+  });
+  /* 预填取值：仅「本次追加」且今天该子模块还没录过才预填待办量，避免追加模式被重复累加成双倍；
+     覆盖模式保留已存值（由调用处兜底）；从任务勾选完成进来的 _lockCount 仍优先锁定，此处不影响。 */
+  const _todoPrefill=(subKey, recordedCnt)=>{
+    if(!isAdd)return '';
+    if(recordedCnt>0)return '';
+    const _nm=subKey?subName(subKey):'__overall__';
+    const _tc=subKey?(_todoCountByName[_nm]||0):(_todoCountByName['__overall__']||0);
+    return _tc>0?_tc:'';
+  };
   // 不同分类记的单位不一样：刷题记题、申论记篇、套卷记套、晨读记次；申论和晨读不记正确率
   const dsUnit=(CHECKIN_UNIT&&CHECKIN_UNIT[t.sec])||'题';
   // 时长预填：仅当本次录入来自「刚结束的番茄钟」（pendingPomoSessId 命中本次模块）才预填该次时长；
@@ -4246,7 +4522,9 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   const prevCount=prev.count||0, prevRate=prev.rate||0;
   const hasOld = prevCount>0 || (isSplit&&subInit.count>0);
   const ttRate=(dsNeedRate&&stat.count>0&&stat.rate!=null)?Math.round(stat.rate)+'%':(dsNeedRate?'—':'');
+  const _showBatchToggle=(!isSplit && !editing);
   const viewHtml=`
+    ${_showBatchToggle?`<div class="rep-batch-toggle" id="repBatchToggleBar"><label class="switch"><input type="checkbox" id="batchToggle"><span class="slider"></span></label><span class="rep-batch-toggle-txt">分批次录入（同题目多笔，如 10+5+5）</span></div>`:''}
     <div class="rep-view" id="repView">
       <div class="rep-summary">
         <div class="rep-sum-item"><span class="rep-sum-k">今日${dsUnitLabel}</span><span class="rep-sum-v">${stat.count||0}</span></div>
@@ -4297,37 +4575,76 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     </div>`;
   const chips=dsNeedRate?`<div class="rep-chips-card"><div class="rep-chips" id="rateChips">${rateChips.map(r=>`<button type="button" class="rep-chip" data-r="${r}">${r}%</button>`).join('')}</div></div>`:'';
   const taskCount=(task&&typeof task.count==='number'&&task.count>0)?task.count:0;
-  // 追加模式：输入框一律留空让用户填「本次」；任务题量仅作占位提示，绝不预填 value（避免误以为已带数据）
-  const svCount = editing?(editRec.count||''):(isAdd?'':(sv.count||taskCount||''));
-  const mainCount = editing?(editRec.count||''):(isAdd?'':(stat.count||taskCount||''));
+  // 追加模式：默认留空让用户填「本次」；但若关联了「同子模块/大类且设了题量」的待办、且今天该子模块还没录过，则自动预填待办题量（可改）
+  const svCount = editing?(editRec.count||''):(isAdd?_todoPrefill(t.sub, sv.count):(sv.count||taskCount||''));
+  const mainCount = editing?(editRec.count||''):(isAdd?_todoPrefill(null, stat.count):(stat.count||taskCount||''));
   const heroRate = (r,isOverall)=>{
     if(isOverall)return (r>0?Math.round(r):'');
     return editing?(editRec.rate?Math.round(editRec.rate):''):(isAdd?'':(r?Math.round(r):''));
   };
+  // —— 分批次录入（同子模块多笔，如 10+5+5）：开关 + 批量行，复用原 rep- 样式 ——
+  const _batchRowHtml=(idxb,countVal,rateVal,minVal)=>`<div class="batch-row" data-batch-idx="${idxb}">
+      <div class="batch-row-head"><span>第 ${idxb} 笔</span><button type="button" class="batch-del" aria-label="删除本笔">×</button></div>
+      <div class="rep-hero-grid${dsNeedRate?'':' two'}">
+        <div class="rep-field"><label class="rep-label">本次题量<i class="req">*</i></label><div class="rep-input"><input type="number" class="field rep-num b-count" min="0" inputmode="numeric" placeholder="题量" value="${countVal||''}"><span class="rep-suffix">${dsUnit}</span></div></div>
+        ${dsNeedRate?`<div class="rep-field"><label class="rep-label">本次正确率<i class="req">*</i></label><div class="rep-input"><input type="text" class="field rep-num b-rate" inputmode="text" placeholder="70 或 14/20" value="${rateVal||''}"><span class="rep-suffix">%</span></div></div>`:''}
+        <div class="rep-field"><label class="rep-label">学习时长<i class="req">*</i></label><div class="rep-input"><input type="number" class="field rep-num b-min" min="0" inputmode="numeric" placeholder="分钟" value="${minVal||''}"><span class="rep-suffix">分钟</span></div></div>
+      </div>
+    </div>`;
+  const _batchInitialRows=()=>{
+    if(_lockCount>0) return _batchRowHtml(1,_lockCount,'', pomoMin||'');
+    if(t.sub){ const _pf=_todoPrefill(t.sub, sv.count); if(_pf) return _batchRowHtml(1,_pf,'', pomoMin||''); }
+    else { const _pf=_todoPrefill(null, stat.count); if(_pf) return _batchRowHtml(1,_pf,'', pomoMin||''); }
+    return _batchRowHtml(1,'','', pomoMin||'');
+  };
+  // 拆分模式：每个子模块的分批录入行（题量 + 正确率 + 学习时长，一笔一行各记各的时长）
+  const _splitBatchRowHtml=(idx,key,countVal,rateVal,minVal)=>`<div class="sub-batch-row">
+      <div class="batch-row-head"><span>第 ${idx} 笔</span></div>
+      <div class="rep-hero-grid${dsNeedRate?'':' two'}">
+        <div class="rep-field"><label class="rep-label">本次题量<i class="req">*</i></label><div class="rep-input"><input type="number" class="field rep-num sb-count" data-sub="${escapeHtml(key)}" min="0" inputmode="numeric" placeholder="题量" value="${countVal||''}"><span class="rep-suffix">${dsUnit}</span></div></div>
+        ${dsNeedRate?`<div class="rep-field"><label class="rep-label">本次正确率<i class="req">*</i></label><div class="rep-input"><input type="text" class="field rep-num sb-rate" data-sub="${escapeHtml(key)}" inputmode="text" placeholder="70 或 14/20" value="${rateVal||''}"><span class="rep-suffix">%</span></div></div>`:''}
+        <div class="rep-field"><label class="rep-label">学习时长<i class="req">*</i></label><div class="rep-input"><input type="number" class="field rep-num sb-min" data-sub="${escapeHtml(key)}" min="0" inputmode="numeric" placeholder="分钟" value="${minVal||''}"><span class="rep-suffix">分钟</span></div></div>
+      </div>
+    </div>`;
+  const _batchWrapHtml=`<div id="batchWrap" style="display:none">
+      <div class="rep-batch-hint" id="batchHint">${_lockCount>0?('待办共 '+_lockCount+' 题，各笔合计需 = '+_lockCount+' 题'):('每笔填题量'+(dsNeedRate?'、正确率':'')+'、学习时长；可加多笔，保存即为多条记录')}</div>
+      <div id="batchRows">${_batchInitialRows()}</div>
+      <button type="button" class="btn btn-ghost rep-batch-add" id="batchAddBtn">+ 再加一笔</button>
+      <div class="rep-preview" id="batchPreview" style="margin-top:10px;"></div>
+    </div>`;
   let entryBody;
   if(editing){
     // 编辑单条：只改该条的 题量/正确率/时长，sub 保留 editRec.sub（忽略拆分/子模块复杂逻辑）
     entryBody=`<div class="rep-card">${hero(mainCount,heroRate(editRec.rate,false),false)}${chips}</div>`;
   } else if(t.sub){
-    entryBody=`<div class="rep-card">${hero(svCount,heroRate(sv.rate,false),false)}${chips}</div>`;
+    entryBody=`<div class="rep-card"><div id="singleWrap">${hero(svCount,heroRate(sv.rate,false),false)}${chips}</div>${_batchWrapHtml}</div>`;
   } else if(!isSplit){
-    entryBody=`<div class="rep-card">${hero(mainCount,heroRate(stat.rate,false),false)}${chips}</div>`;
+    entryBody=`<div class="rep-card"><div id="singleWrap">${hero(mainCount,heroRate(stat.rate,false),false)}${chips}</div>${_batchWrapHtml}</div>`;
   } else {
     const subList=splitSubEntries(t.sec);
     const subRows=subList.map(s=>{
       const sub=(stat.subs&&stat.subs[s.key])||{count:0,rate:0};
       const done=(sub.count>0)?`<span class="rep-sub-done">已录${sub.count}</span>`:'';
-      return `<div class="rep-sub-row">
-          <span class="rep-sub-name">${escapeHtml(s.name)}${done}</span>
-          <div class="rep-cell"><input type="number" class="field ds-sub-count" data-sub="${escapeHtml(s.key)}" min="0" inputmode="numeric" placeholder="${isAdd?'本次':'题量'}" value="${isAdd?'':(sub.count||'')}"><span class="rep-suffix">题</span></div>
+      const prefill=isAdd?(_todoPrefill(s.key, sub.count)||''):(sub.count||'');
+      const single=`<div class="sub-single">
+          <div class="rep-cell"><input type="number" class="field ds-sub-count" data-sub="${escapeHtml(s.key)}" min="0" inputmode="numeric" placeholder="${isAdd?'本次':'题量'}" value="${prefill}"><span class="rep-suffix">题</span></div>
           ${dsNeedRate?`<div class="rep-cell"><input type="text" class="field ds-sub-rate" data-sub="${escapeHtml(s.key)}" inputmode="text" placeholder="70 或 14/20" value="${isAdd?'':(sub.rate?Math.round(sub.rate):'')}"><span class="rep-suffix">%</span></div>`:''}
+        </div>`;
+      const batch=`<div class="sub-batch" data-sub="${escapeHtml(s.key)}" style="display:none">
+          <div class="sub-batch-rows">${_splitBatchRowHtml(1,s.key,'','')}</div>
+          <button type="button" class="btn btn-ghost sub-batch-add" data-sub="${escapeHtml(s.key)}">+ 该子模块再加一笔</button>
+        </div>`;
+      return `<div class="rep-sub-row" data-sub="${escapeHtml(s.key)}">
+          <div class="rep-sub-row-head"><span class="rep-sub-name">${escapeHtml(s.name)}${done}</span><label class="sub-batch-chip"><input type="checkbox" class="sub-batch-toggle" data-sub="${escapeHtml(s.key)}"><span>分批</span></label></div>
+          ${single}
+          ${batch}
         </div>`;
     }).join('');
     entryBody=`<div class="rep-card">${hero('', '', true)}`
       + `<div class="rep-subs-card">
           <div class="rep-subs-head"><span class="rep-subs-title">${isAdd?'子模块录入（填本次，保存为一条记录）':'子模块录入'}</span><span class="rep-subs-tip">填写后自动汇总</span></div>
           <div class="rep-sub-rows">${subRows}</div>
-          <div class="rep-time-row"><label class="rep-label">学习时长<i class="req">*</i></label><div class="rep-input"><input type="number" id="dsMinutes" class="field rep-num" min="0" inputmode="numeric" placeholder="0" value="${pomoMin||''}"><span class="rep-suffix">分钟</span></div></div>
+          <div class="rep-time-row" id="repTimeRow"><label class="rep-label" id="repTimeLabel">其他学习时长<i class="req">*</i></label><div class="rep-input"><input type="number" id="dsMinutes" class="field rep-num" min="0" inputmode="numeric" placeholder="0" value="${pomoMin||''}"><span class="rep-suffix">分钟</span></div></div>
           <div class="rep-preview" id="repPreview"></div>
         </div>`
       + `</div>`;
@@ -4367,13 +4684,87 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   const entryEl=document.getElementById('repEntry');
   const btns=document.getElementById('repBottom');
   function showView(){viewEl.style.display='';entryEl.style.display='none';btns.querySelector('.rep-only-view').style.display='';btns.querySelectorAll('.rep-only-entry').forEach(el=>el.style.display='none');}
-  function showEntry(){viewEl.style.display='none';entryEl.style.display='';btns.querySelector('.rep-only-view').style.display='none';btns.querySelectorAll('.rep-only-entry').forEach(el=>el.style.display='');const fc=document.querySelector('#repEntry .ds-sub-count');if(fc)fc.focus();else{const ce=document.getElementById('dsCount');if(ce&&!ce.readOnly)ce.focus();}}
+  function showEntry(){viewEl.style.display='none';entryEl.style.display='';btns.querySelector('.rep-only-view').style.display='none';btns.querySelectorAll('.rep-only-entry').forEach(el=>el.style.display='');const _bt=document.getElementById('batchToggle');if(_bt&&_bt.checked){const sw=document.getElementById('singleWrap');const bw=document.getElementById('batchWrap');if(sw)sw.style.display='none';if(bw)bw.style.display='';const bc=document.querySelector('#batchRows .b-count');if(bc)bc.focus();return;}const fc=document.querySelector('#repEntry .ds-sub-count');if(fc)fc.focus();else{const ce=document.getElementById('dsCount');if(ce&&!ce.readOnly)ce.focus();}}
   const addBtn=document.getElementById('repAddBtn');
   if(addBtn)addBtn.addEventListener('click',showEntry);
   const coverBtn=document.getElementById('repCoverBtn');
   if(coverBtn)coverBtn.addEventListener('click',()=>{openTaskReport(t,'set',_completeTodoId,true);});
   const cancelBtn=document.getElementById('repCancelBtn');
   if(cancelBtn)cancelBtn.addEventListener('click',showView);
+  // 分批次录入：开关切换显隐、加行、删行、重新编号（不重建面板，复用原样式）
+  const _btEl=document.getElementById('batchToggle');
+  if(_btEl){
+    const _renum=()=>{const rs=document.querySelectorAll('#batchRows .batch-row');rs.forEach((r,i)=>{const sp=r.querySelector('.batch-row-head span');if(sp)sp.textContent='第 '+(i+1)+' 笔';const dl=r.querySelector('.batch-del');if(dl)dl.style.display=rs.length>1?'':'none';});_batchRecompute();};
+    _btEl.addEventListener('change',()=>{const on=_btEl.checked;const sw=document.getElementById('singleWrap');const bw=document.getElementById('batchWrap');if(sw)sw.style.display=on?'none':'';if(bw)bw.style.display=on?'':'none';if(on){if(document.querySelectorAll('#batchRows .batch-row').length===0){const cont=document.getElementById('batchRows');if(cont)cont.insertAdjacentHTML('beforeend',_batchRowHtml(1,(_lockCount>0?_lockCount:''),'', pomoMin||''));_renum();}}else{const _bc=document.getElementById('dsCount');if(_bc&&!_bc.readOnly)_bc.focus();}});
+    const _addB=document.getElementById('batchAddBtn');
+    if(_addB)_addB.addEventListener('click',()=>{const cont=document.getElementById('batchRows');if(!cont)return;const n=cont.querySelectorAll('.batch-row').length+1;cont.insertAdjacentHTML('beforeend',_batchRowHtml(n,'','', pomoMin||''));_renum();});
+    // 事件委托：删除按钮 + 输入监听（处理动态新增行）
+    const _batchWrap=document.getElementById('batchWrap');
+    if(_batchWrap){
+      _batchWrap.addEventListener('click',(e)=>{const btn=e.target.closest('.batch-del');if(!btn)return;const row=btn.closest('.batch-row');if(row)row.remove();_renum();});
+      _batchWrap.addEventListener('input',()=>{_batchRecompute();});
+    }
+    // 分批模式实时汇总
+    const _batchRecompute=()=>{
+      const prev=document.getElementById('batchPreview');if(!prev)return;
+      let sumC=0,sumMin=0,sw=0,has=false;
+      document.querySelectorAll('#batchRows .batch-row').forEach(r=>{
+        const c=Math.max(0,parseInt(r.querySelector('.b-count').value,10)||0);
+        if(c<=0)return;
+        const rInp=r.querySelector('.b-rate');
+        const rp=dsNeedRate?parseRateInput(rInp?rInp.value:''):null;
+        const rt=(rp&&rp.valid)?rp.rate:0;
+        const mInp=r.querySelector('.b-min');
+        const m=Math.max(0,parseInt(mInp?mInp.value:0,10)||0);
+        sumC+=c;sumMin+=m;sw+=c*rt;has=true;
+      });
+      if(has){
+        const avg=dsNeedRate&&sumC>0?Math.round(sw/sumC):null;
+        const parts=['已填 '+document.querySelectorAll('#batchRows .batch-row').length+' 笔'];
+        parts.push('合计 '+sumC+' '+dsUnit);
+        if(avg!=null)parts.push('平均正确率 '+avg+'%');
+        parts.push('合计 '+sumMin+' 分钟');
+        if(_lockCount>0&&sumC!==_lockCount)parts.push('⚠ 合计 ≠ 待办 '+_lockCount);
+        prev.innerHTML=parts.join('，');
+      }else{prev.innerHTML='';}
+    };
+  }
+  // 拆分模式：每个子模块「分批」开关（隐藏单行输入、展开多笔），加行重编号
+  // 拆分模式：时长跟着分批走——全部子模块都分批时隐藏底部共享时长框；部分分批时标为「其他学习时长」
+  const _syncTimeRow=()=>{
+    const tgs=document.querySelectorAll('.sub-batch-toggle');
+    if(!tgs.length)return;
+    const anyBatch=Array.from(tgs).some(x=>x.checked);
+    const allBatch=Array.from(tgs).every(x=>x.checked);
+    const tr=document.getElementById('repTimeRow');
+    if(tr)tr.style.display=allBatch?'none':'';
+    const lb=document.getElementById('repTimeLabel');
+    if(lb&&lb.firstChild)lb.firstChild.textContent=anyBatch?'其他学习时长':'学习时长';
+  };
+  document.querySelectorAll('.sub-batch-toggle').forEach(tg=>{
+    tg.addEventListener('change',()=>{
+      const key=tg.dataset.sub;
+      const row=tg.closest('.rep-sub-row'); if(!row)return;
+      const single=row.querySelector('.sub-single');
+      const batch=row.querySelector('.sub-batch');
+      const on=tg.checked;
+      if(single)single.style.display=on?'none':'';
+      if(batch)batch.style.display=on?'':'none';
+      if(on){const cont=batch&&batch.querySelector('.sub-batch-rows');if(cont&&cont.children.length===0)cont.insertAdjacentHTML('beforeend',_splitBatchRowHtml(1,key,'','',''));}
+      _syncTimeRow();
+      if(preview&&recompute)recompute();
+    });
+  });
+  _syncTimeRow();
+  document.querySelectorAll('.sub-batch-add').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const key=btn.dataset.sub;
+      const cont=btn.closest('.sub-batch')&&btn.closest('.sub-batch').querySelector('.sub-batch-rows');
+      if(!cont)return;
+      const n=cont.querySelectorAll('.sub-batch-row').length+1;
+      cont.insertAdjacentHTML('beforeend',_splitBatchRowHtml(n,key,'',''));
+    });
+  });
   // 交互
   const countEl=$('#dsCount'), rateEl=$('#dsRate');
   const chipEls=dsNeedRate?document.querySelectorAll('#rateChips .rep-chip'):[];
@@ -4393,18 +4784,31 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   if(modeBtn)modeBtn.addEventListener('click',()=>{openTaskReport(t,isAdd?'set':'add',_completeTodoId,true);});
   // 拆分模块：实时汇总到上方整体（题量求和、正确率加权平均），并切只读
   const preview=$('#repPreview');
+  let recompute=null;
   if(preview){
-    const recompute=()=>{
+    recompute=()=>{
       let sc=0,sw=0,has=false,base=0,bc=0,bw=0;
-      document.querySelectorAll('.ds-sub-count').forEach(inp=>{
-        const c0=Math.max(0,parseInt(inp.value,10)||0);
-        const rInp=document.querySelector('.ds-sub-rate[data-sub="'+inp.dataset.sub+'"]');
-        const rp=parseRateInput(rInp?rInp.value:'');
-        const r=(rp&&rp.valid)?rp.rate:0;
-        // 追加模式下整体显示的是「保存后的累计」：今日已有 + 本次
-        const mg=mergeAdd((stat.subs||{})[inp.dataset.sub],c0,r);
-        if(mg.count>0){sc+=mg.count;sw+=mg.count*(mg.rate||0);has=true;}
-        base+=c0; bc+=c0; if(r)bw+=c0*r;
+      document.querySelectorAll('.rep-sub-row').forEach(rowEl=>{
+        const tog=rowEl.querySelector('.sub-batch-toggle');
+        if(tog&&tog.checked){
+          rowEl.querySelectorAll('.sub-batch-row').forEach(r=>{
+            const c0=Math.max(0,parseInt(r.querySelector('.sb-count').value,10)||0);
+            if(c0<=0)return;
+            const rInp=r.querySelector('.sb-rate');
+            const rp=parseRateInput(rInp?rInp.value:'');
+            const rt=(rp&&rp.valid)?rp.rate:0;
+            sc+=c0;sw+=c0*rt;has=true;base+=c0;bc+=c0;if(rt)bw+=c0*rt;
+          });
+        }else{
+          const c0=Math.max(0,parseInt(rowEl.querySelector('.ds-sub-count').value,10)||0);
+          const rInp=rowEl.querySelector('.ds-sub-rate');
+          const rp=parseRateInput(rInp?rInp.value:'');
+          const r=(rp&&rp.valid)?rp.rate:0;
+          // 追加模式下整体显示的是「保存后的累计」：今日已有 + 本次
+          const mg=mergeAdd((stat.subs||{})[rowEl.dataset.sub],c0,r);
+          if(mg.count>0){sc+=mg.count;sw+=mg.count*(mg.rate||0);has=true;}
+          base+=c0; bc+=c0; if(r)bw+=c0*r;
+        }
       });
       if(has){
         const avg=Math.round(sw/sc);
@@ -4428,7 +4832,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
       }
       syncChips();
     };
-    document.querySelectorAll('.ds-sub-count,.ds-sub-rate').forEach(inp=>inp.addEventListener('input',recompute));
+    document.querySelectorAll('.ds-sub-count,.ds-sub-rate,.sb-count,.sb-rate').forEach(inp=>inp.addEventListener('input',recompute));
     recompute();
   }
   // 默认视图：番茄钟刚结束→直接录入；否则显示「查看」
@@ -4453,116 +4857,173 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
       if(Object.keys(state.dailyStats[d]).length===0)delete state.dailyStats[d];
       save();openTaskReport(t, dsMode, _completeTodoId);return;
     }
-    const count=Math.max(0,parseInt(countEl.value,10)||0);
-    const rateParsed=dsNeedRate?parseRateInput(rateEl?rateEl.value:''):null;
-    const rate=dsNeedRate?(rateParsed&&rateParsed.valid?rateParsed.rate:null):null;
-    // —— 必填校验：录入时题量和正确率缺一不可（留空正确率会把题量算进分母、污染整体正确率）——
-    const existingSec=(state.dailyStats[d]||{})[t.sec];
-    const hasExisting=!!(existingSec&&(existingSec.count>0||(existingSec.subs&&Object.keys(existingSec.subs).length)));
-    const rateEmpty=dsNeedRate&&!(rateParsed&&rateParsed.valid);
-    if(isSplit){
-      let any=false;const miss=[];
-      document.querySelectorAll('.ds-sub-count').forEach(inp=>{
-        const c=Math.max(0,parseInt(inp.value,10)||0);
-        if(c<=0)return;
-        any=true;
-        const rInp=document.querySelector('.ds-sub-rate[data-sub="'+inp.dataset.sub+'"]');
-        const rv=(rInp?rInp.value:'').trim();
-        if(dsNeedRate&&!(parseRateInput(rv)).valid)miss.push(subName(inp.dataset.sub)||inp.dataset.sub);
-      });
-      if(any){if(dsNeedRate&&miss.length){toast('子模块「'+miss.join('、')+'」填了题量但没填正确率');return;}}
-      else if(count>0){if(rateEmpty){toast('请填写正确率');return;}}
-      else if(!hasExisting){toast('请填写题量');return;}
-      // 待办题量锁定：子模块只要有填，合计必须等于锁定题量（拆出来的明细要对得上）
-      if(_lockCount>0){
-        let _anySub=false,_subSum=0;
-        document.querySelectorAll('.ds-sub-count').forEach(inp=>{
-          const c=Math.max(0,parseInt(inp.value,10)||0);
-          if(c>0){_anySub=true;_subSum+=c;}
+    const batchOn = (!isSplit && !editing && document.getElementById('batchToggle') && document.getElementById('batchToggle').checked);
+    let newRecs=[]; let _newMin=0; let _splitBatchMinSum=0;
+    // 拆分模式：读取某个子模块行的录入数据（未开分批=单行 题量/正确率；开了分批=多笔 题量/正确率/时长）
+    const readSubRow=(rowEl)=>{
+      const key=rowEl.dataset.sub;
+      const tog=rowEl.querySelector('.sub-batch-toggle');
+      const out=[];
+      if(tog&&tog.checked){
+        rowEl.querySelectorAll('.sub-batch-row').forEach(r=>{
+          const c=Math.max(0,parseInt(r.querySelector('.sb-count').value,10)||0);
+          if(c<=0)return;
+          const rInp=r.querySelector('.sb-rate');
+          const mInp=r.querySelector('.sb-min');
+          out.push({key,count:c,rateStr:rInp?rInp.value.trim():'',min:(mInp&&mInp.value.trim()!=='')?(Math.max(0,parseInt(mInp.value,10)||0)):null,batch:true});
         });
-        if(_anySub&&_subSum!==_lockCount){toast('子模块合计 '+_subSum+' 题，需等于待办 '+_lockCount+' 题');return;}
+      }else{
+        const cInp=rowEl.querySelector('.ds-sub-count');
+        const c=Math.max(0,parseInt(cInp?cInp.value:10)||0);
+        if(c<=0)return out;
+        const rInp=rowEl.querySelector('.ds-sub-rate');
+        out.push({key,count:c,rateStr:rInp?rInp.value.trim():''});
       }
+      return out;
+    };
+    if(batchOn){
+      // —— 分批次录入：同子模块分多笔（如 10+5+5），每笔各自 题量/正确率/学习时长 ——
+      const rows=[].slice.call(document.querySelectorAll('#batchRows .batch-row'));
+      let _sumC=0,_totMin=0,_bad=false;
+      rows.forEach(function(row,i){
+        const c=Math.max(0,parseInt(row.querySelector('.b-count').value,10)||0);
+        const rInp=row.querySelector('.b-rate');
+        const rp=dsNeedRate?parseRateInput(rInp?rInp.value:''):null;
+        const r=dsNeedRate?(rp&&rp.valid?rp.rate:null):null;
+        const mEl=row.querySelector('.b-min');
+        const m=Math.max(0,parseInt(mEl?mEl.value:0,10)||0);
+        if(c<=0){toast('第'+(i+1)+'笔题量未填');_bad=true;return;}
+        if(dsNeedRate&&!(rp&&rp.valid)){toast('第'+(i+1)+'笔正确率未填或格式错');_bad=true;return;}
+        if(m<=0){toast('第'+(i+1)+'笔学习时长未填');_bad=true;return;}
+        _sumC+=c;_totMin+=m;
+        newRecs.push({sub:(t.sub?subName(t.sub)||t.sub:null),count:c,rate:dsNeedRate?r:null,min:m,ts:Date.now()});
+      });
+      if(_bad)return;
+      if(_lockCount>0 && _sumC!==_lockCount){toast('各笔题量合计 '+_sumC+' ≠ 待办 '+_lockCount+' 题');return;}
+      newRecs.forEach(function(rr){const _t=plannedDurFor(t.sec,rr.sub,rr.count);if(_t>0){rr.overtimeMin=Math.max(0,rr.min-_t);rr.overtime=rr.overtimeMin>0;}else{rr.overtimeMin=0;rr.overtime=false;}});
+      _newMin=_totMin;
     }else{
-      if(count>0){if(rateEmpty){toast('请填写正确率');return;}}
-      else if(!hasExisting){toast('请填写题量');return;}
+      // ===== 原有 单笔 / 拆分 录入逻辑（保持不变）=====
+      const count=Math.max(0,parseInt(countEl.value,10)||0);
+      const rateParsed=dsNeedRate?parseRateInput(rateEl?rateEl.value:''):null;
+      const rate=dsNeedRate?(rateParsed&&rateParsed.valid?rateParsed.rate:null):null;
+      const existingSec=(state.dailyStats[d]||{})[t.sec];
+      const hasExisting=!!(existingSec&&(existingSec.count>0||(existingSec.subs&&Object.keys(existingSec.subs).length)));
+      const rateEmpty=dsNeedRate&&!(rateParsed&&rateParsed.valid);
+      if(isSplit){
+        let any=false;const miss=[];const _entries=[];
+        document.querySelectorAll('.rep-sub-row').forEach(rowEl=>{
+          readSubRow(rowEl).forEach(e=>{
+            any=true;
+            if(dsNeedRate&&!(parseRateInput(e.rateStr)).valid)miss.push(subName(e.key)||e.key);
+            _entries.push(e);
+          });
+        });
+        if(any){if(dsNeedRate&&miss.length){toast('子模块「'+miss.join('、')+'」填了题量但没填正确率');return;}}
+        else if(count>0){if(rateEmpty){toast('请填写正确率');return;}}
+        else if(!hasExisting){toast('请填写题量');return;}
+        // 分批的每一笔都要有自己的学习时长
+        const missT=[];
+        _entries.forEach(e=>{
+          if(!e.batch)return;
+          if(e.min===null)missT.push(subName(e.key)||e.key);
+          else _splitBatchMinSum+=e.min;
+        });
+        if(missT.length){toast('子模块「'+missT.join('、')+'」的分批笔没填学习时长');return;}
+        // 待办题量锁定：子模块只要有填，合计必须等于锁定题量（拆出来的明细要对得上）
+        if(_lockCount>0){
+          let _subSum=0;_entries.forEach(e=>_subSum+=e.count);
+          if(_subSum!==_lockCount){toast('子模块合计 '+_subSum+' 题，需等于待办 '+_lockCount+' 题');return;}
+        }
+      }else{
+        if(count>0){if(rateEmpty){toast('请填写正确率');return;}}
+        else if(!hasExisting){toast('请填写题量');return;}
+      }
+      // 学习时长必填（番茄钟自动带入或手动填）；分批时每笔自带时长，底部共享框隐藏即不计
+      const _minEl=document.getElementById('dsMinutes');
+      const _trEl=document.getElementById('repTimeRow');
+      const _sharedMin=(_trEl&&_trEl.style.display==='none')?0:Math.max(0,parseInt(_minEl?_minEl.value:0,10)||0);
+      _newMin=_sharedMin+_splitBatchMinSum;
+      if(_newMin<=0){toast('请填写学习时长（番茄钟自动带入，或手动填分钟数）');return;}
+      newRecs=[];
+      if(t.sub){
+        if(count>0)newRecs.push({sub:subName(t.sub)||t.sub,count:count,rate:dsNeedRate?rate:null,ts:Date.now()});
+      } else if(isSplit){
+        document.querySelectorAll('.rep-sub-row').forEach(rowEl=>{
+          readSubRow(rowEl).forEach(e=>{
+            const rp=parseRateInput(e.rateStr);
+            const r=(rp&&rp.valid)?rp.rate:null;
+            const _rec={sub:e.key,count:e.count,rate:dsNeedRate?r:null,ts:Date.now()};
+            if(e.min!=null)_rec.min=e.min; // 分批笔自带时长
+            newRecs.push(_rec);
+          });
+        });
+        {
+          const subSum=newRecs.reduce((a,x)=>a+x.count,0);
+          const overallFromInput=Math.max(0,parseInt(countEl.value,10)||0);
+          if(overallFromInput>subSum){
+            // 整体框大于子模块汇总：超出部分作为整体记录补充（不重复计入子模块）
+            newRecs.push({sub:null,count:overallFromInput-subSum,rate:dsNeedRate?rate:null,ts:Date.now()});
+          } else if(subSum===0&&overallFromInput>0){
+            // 只填了整体框、未填任何子模块：整条作为整体记录
+            newRecs.push({sub:null,count:overallFromInput,rate:dsNeedRate?rate:null,ts:Date.now()});
+          } else if(subSum>overallFromInput&&overallFromInput>0){
+            // #8「整体手填为准」：子模块题量按比例折算，使合计严格=整体题量；
+            // 各子正确率是自身比率不折算。floor 余数按比例余量补 1，为 0 的行剔除
+            const _target=overallFromInput;
+            const alloc=new Array(newRecs.length).fill(0);let acc=0;
+            newRecs.forEach((x,i)=>{alloc[i]=Math.floor(x.count*_target/subSum);acc+=alloc[i];});
+            let remain=_target-acc;
+            newRecs.map((x,i)=>({i:i,f:x.count*_target/subSum-alloc[i]}))
+              .sort((a,b)=>b.f-a.f)
+              .forEach(o=>{if(remain>0){alloc[o.i]++;remain--;}});
+            newRecs.forEach((x,i)=>x.count=alloc[i]);
+            newRecs=newRecs.filter(x=>x.count>0);
+            toast('子模块汇总 '+subSum+' 题 > 整体 '+_target+' 题，已按整体 '+_target+' 题折算保存');
+          }
+        }
+      } else {
+        if(count>0)newRecs.push({sub:null,count:count,rate:dsNeedRate?rate:null,ts:Date.now()});
+      }
+      if(!newRecs.length){ toast('没有可保存的题量'); return; }
+      // 拆分模块：时长整段共享，超时挂在「整体(无子模块)」记录上；纯子模块拆分则不标（时长无法分摊到子模块）
+      if(isSplit){
+        const overallRec=newRecs.find(r=>r.sub===null);
+        if(overallRec){const _tc=newRecs.reduce((a,x)=>a+(x.count||0),0);const _t=plannedDurFor(t.sec,null,_tc);if(_t>0){overallRec.overtimeMin=Math.max(0,_newMin-_t);overallRec.overtime=overallRec.overtimeMin>0;}else{overallRec.overtimeMin=0;overallRec.overtime=false;}}
+      }
+      // 每条记录挂本次录入时长（番茄钟预填或手填），查看详情可逐条看到：
+      // 非拆分=整段挂本条；拆分模块一次录入是一整段时间——
+      //   · 纯子模块行：按题量比例分摊，各行之和严格=_newMin（旧逻辑每行都盖整段，速度卡时长翻倍）
+      //   · 有整体(差量)行：统计口径只认整体行（collectTimeEntries 会跳过子行），整段挂它，子行按比例分摊供逐条展示
+      if(isSplit){
+        // 分批笔自带时长，先从总时长里扣掉，剩余（底部共享框填的）再按题量分摊
+        const _ownSum=newRecs.reduce((a,r)=>a+(r.min||0),0);
+        const _restMin=Math.max(0,_newMin-_ownSum);
+        const _oi=newRecs.findIndex(r=>r.sub===null);
+        if(_oi>=0){
+          const _subRows=newRecs.filter(r=>r.sub!==null&&r.min==null);
+          const _sm=allocMinutesByCount(_subRows,_restMin);let _j=0;
+          _subRows.forEach(r=>{r.min=_sm[_j++];});
+          newRecs[_oi].min=_restMin;
+        }else{
+          const _noOwn=newRecs.filter(r=>r.min==null);
+          const _m=allocMinutesByCount(_noOwn,_restMin);
+          _noOwn.forEach((r,i)=>{r.min=_m[i];});
+        }
+      }else{
+        newRecs.forEach(r=>{r.min=_newMin;});
+      }
+      if(!isSplit)newRecs.forEach(r=>{const _t=plannedDurFor(t.sec,r.sub,r.count);if(_t>0){r.overtimeMin=Math.max(0,_newMin-_t);r.overtime=r.overtimeMin>0;}else{r.overtimeMin=0;r.overtime=false;}});
     }
-    // 学习时长必填（番茄钟自动带入或手动填）；提前到建数据壳之前校验，避免留空壳
-    const _minEl=document.getElementById('dsMinutes');
-    const _newMin=Math.max(0,parseInt(_minEl?_minEl.value:0,10)||0);
-    if(_newMin<=0){toast('请填写学习时长（番茄钟自动带入，或手动填分钟数）');return;}
+    // ===== 共享收尾：建数据壳、累加时长、覆盖替换、合并重算（单笔/拆分/分批 通用）=====
     if(!state.dailyStats[d])state.dailyStats[d]={};
     if(!state.dailyStats[d][t.sec])state.dailyStats[d][t.sec]={count:0,rate:0,subs:{},records:[]};
     const rec=state.dailyStats[d][t.sec];
     seedRecordsIfLegacy(rec);
     if(!rec.records)rec.records=[];
-    // #9: 学习时长（追加模式累加，覆盖模式用新值，_newMin 在上方必填校验处取得）
     const _oldMin=rec.minutes||0;
-    rec.minutes=isAdd?(_oldMin+_newMin):_newMin;
+    rec.minutes = isAdd?(_oldMin+_newMin):_newMin;
     if(rec.minutes<=0)delete rec.minutes;
-    // 构造本次要写入的「一条独立记录」（不原地累加，避免融合失真）
-    let newRecs=[];
-    if(t.sub){
-      if(count>0)newRecs.push({sub:subName(t.sub)||t.sub,count:count,rate:dsNeedRate?rate:null,ts:Date.now()});
-    } else if(isSplit){
-      document.querySelectorAll('.ds-sub-count').forEach(inp=>{
-        const c=Math.max(0,parseInt(inp.value,10)||0); if(c<=0)return;
-        const rInp=document.querySelector('.ds-sub-rate[data-sub="'+inp.dataset.sub+'"]');
-        const rp=parseRateInput(rInp?rInp.value:'');
-        const r=(rp&&rp.valid)?rp.rate:null;
-        newRecs.push({sub:inp.dataset.sub,count:c,rate:dsNeedRate?r:null,ts:Date.now()});
-      });
-      {
-        const subSum=newRecs.reduce((a,x)=>a+x.count,0);
-        const overallFromInput=Math.max(0,parseInt(countEl.value,10)||0);
-        if(overallFromInput>subSum){
-          // 整体框大于子模块汇总：超出部分作为整体记录补充（不重复计入子模块）
-          newRecs.push({sub:null,count:overallFromInput-subSum,rate:dsNeedRate?rate:null,ts:Date.now()});
-        } else if(subSum===0&&overallFromInput>0){
-          // 只填了整体框、未填任何子模块：整条作为整体记录
-          newRecs.push({sub:null,count:overallFromInput,rate:dsNeedRate?rate:null,ts:Date.now()});
-        } else if(subSum>overallFromInput&&overallFromInput>0){
-          // #8「整体手填为准」：子模块题量按比例折算，使合计严格=整体题量；
-          // 各子正确率是自身比率不折算。floor 余数按比例余量补 1，为 0 的行剔除
-          const _target=overallFromInput;
-          const alloc=new Array(newRecs.length).fill(0);let acc=0;
-          newRecs.forEach((x,i)=>{alloc[i]=Math.floor(x.count*_target/subSum);acc+=alloc[i];});
-          let remain=_target-acc;
-          newRecs.map((x,i)=>({i:i,f:x.count*_target/subSum-alloc[i]}))
-            .sort((a,b)=>b.f-a.f)
-            .forEach(o=>{if(remain>0){alloc[o.i]++;remain--;}});
-          newRecs.forEach((x,i)=>x.count=alloc[i]);
-          newRecs=newRecs.filter(x=>x.count>0);
-          toast('子模块汇总 '+subSum+' 题 > 整体 '+_target+' 题，已按整体 '+_target+' 题折算保存');
-        }
-      }
-    } else {
-      if(count>0)newRecs.push({sub:null,count:count,rate:dsNeedRate?rate:null,ts:Date.now()});
-    }
-    if(!newRecs.length){ toast('没有可保存的题量'); return; }
-    // 拆分模块：时长整段共享，超时挂在「整体(无子模块)」记录上；纯子模块拆分则不标（时长无法分摊到子模块）
-    if(isSplit){
-      const overallRec=newRecs.find(r=>r.sub===null);
-      if(overallRec){const _tc=newRecs.reduce((a,x)=>a+(x.count||0),0);const _t=plannedDurFor(t.sec,null,_tc);if(_t>0){overallRec.overtimeMin=Math.max(0,_newMin-_t);overallRec.overtime=overallRec.overtimeMin>0;}else{overallRec.overtimeMin=0;overallRec.overtime=false;}}
-    }
-    // 每条记录挂本次录入时长（番茄钟预填或手填），查看详情可逐条看到：
-    // 非拆分=整段挂本条；拆分模块一次录入是一整段时间——
-    //   · 纯子模块行：按题量比例分摊，各行之和严格=_newMin（旧逻辑每行都盖整段，速度卡时长翻倍）
-    //   · 有整体(差量)行：统计口径只认整体行（collectTimeEntries 会跳过子行），整段挂它，子行按比例分摊供逐条展示
-    if(isSplit){
-      const _oi=newRecs.findIndex(r=>r.sub===null);
-      if(_oi>=0){
-        const _subRows=newRecs.filter(r=>r.sub!==null);
-        const _sm=allocMinutesByCount(_subRows,_newMin);let _j=0;
-        newRecs.forEach(r=>{if(r.sub!==null)r.min=_sm[_j++];});
-        newRecs[_oi].min=_newMin;
-      }else{
-        const _m=allocMinutesByCount(newRecs,_newMin);
-        newRecs.forEach((r,i)=>{r.min=_m[i];});
-      }
-    }else{
-      newRecs.forEach(r=>{r.min=_newMin;});
-    }
-    if(!isSplit)newRecs.forEach(r=>{const _t=plannedDurFor(t.sec,r.sub,r.count);if(_t>0){r.overtimeMin=Math.max(0,_newMin-_t);r.overtime=r.overtimeMin>0;}else{r.overtimeMin=0;r.overtime=false;}});
     // 覆盖模式：大类(含拆分模块)整段替换当天该模块记录；子模块任务只替换该子模块
     if(!isAdd){
       rec.records= t.sub ? rec.records.filter(r=>r.sub!==t.sub) : [];
@@ -4593,6 +5054,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
               if(!_doneNoToast)toast('待办题量达标，已自动完成 · 下次 '+(_relTodo.dueDate?_relTodo.dueDate.slice(5):'长期'));
             }
           }else{_relTodo.done=true;_relTodo.lastDone=todayStr();if(!_doneNoToast)toast('待办题量达标，已自动完成：'+_relTodo.text);}
+          markTodoModified(_relTodo);
         }else{
           toast('已记录 '+_todayCount+'/'+_relTodo.count+' 题，继续加油');
         }
@@ -4614,6 +5076,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
           _at.done=true;_at.lastDone=todayStr();
           toast('已自动完成任务：'+_at.text);
         }
+        markTodoModified(_at);
       }
       pomo.taskId='';
     }
@@ -4627,7 +5090,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     // 从「勾选任务」进来的录入：保存成功才把该任务标记完成；取消则任务保持未做、仍在列表（不再一勾就消失）
     if(_completeTodoId){
       const _ct=(state.todos||[]).find(x=>x.id===_completeTodoId);
-      if(_ct && !_ct.done){_ct.done=true;_ct.lastDone=todayStr();}
+      if(_ct && !_ct.done){_ct.done=true;_ct.lastDone=todayStr();markTodoModified(_ct);}
     }
     // （已移除）原「录完一笔自动挂复盘待办」逻辑 —— 复盘功能下线，历史数据由 migrateTodos 清理
     save();closeModal();render();
@@ -5129,9 +5592,9 @@ function setShenlunType(id){
       <button class="btn" id="stSave">保存</button>
     </div>`);
   const saveBtn=$('#stSave');
-  if(saveBtn)saveBtn.addEventListener('click',()=>{r.type=$('#stType').value;save();render();closeModal();toast('已标记题型：'+r.type);});
+  if(saveBtn)saveBtn.addEventListener('click',()=>{r.type=$('#stType').value;r.mts=Date.now();save();render();closeModal();toast('已标记题型：'+r.type);});
   const clr=document.getElementById('stClear');
-  if(clr)clr.addEventListener('click',()=>{delete r.type;save();render();closeModal();toast('已清除题型');});
+  if(clr)clr.addEventListener('click',()=>{delete r.type;r.mts=Date.now();save();render();closeModal();toast('已清除题型');});
 }
 function openShenlunReviewDetail(id){
   const r=(state.shenlunReviews||[]).find(x=>x.id===id);if(!r)return;
@@ -5152,7 +5615,7 @@ function openShenlunReviewDetail(id){
 /* 写入一条批改记录（由豆包批改后调用；也兼容手工录入） */
 function addShenlunReview(d){
   if(!state.shenlunReviews)state.shenlunReviews=[];
-  const rec=Object.assign({id:uid(),date:todayStr(),type:'',label:'',teacher:'',score:'',conclusion:'',points:[],advice:[],origin:''},d||{});
+  const rec=Object.assign({id:uid(),date:todayStr(),type:'',label:'',teacher:'',score:'',conclusion:'',points:[],advice:[],origin:'',mts:Date.now()},d||{});
   state.shenlunReviews.unshift(rec);
   /* 申论录分 → 自动完成同模块未完成待办（申论按「条」计，录一条算完成一次练习；优先匹配文本含题型的） */
   const typ=(rec.type||'').toString();
@@ -5168,6 +5631,7 @@ function addShenlunReview(d){
     }else{
       match.done=true;
     }
+    markTodoModified(match);
     setTimeout(()=>toast('已自动完成申论待办：'+(match.text||'')),600);
   }
   save();render();
@@ -6053,7 +6517,8 @@ function _cmRows(keys){
   tks.forEach(tk=>{
     _cmCollect(tk).forEach(r=>{
       rows.push({tk:tk,item:r.item,index:r.index,source:r.source,
-        rid:tk+':'+(r.source==='builtin'?'b':'c')+':'+r.index,
+        /* 自定义条目用内容 id 做 rid（稳定），内置用下标——展开/勾选状态跨增删、切tab不漂移 */
+        rid:tk+':'+(r.source==='builtin'?'b':'c')+':'+(r.source==='builtin'?r.index:((r.item&&r.item.id)||('i'+r.index))),
         summary:CONTENT_TYPE_MAP[tk].summary(r.item)});
     });
   });
@@ -6400,13 +6865,15 @@ function bindCmPane(){
     const actEl=e.target.closest('[data-action]');if(!actEl)return;
     const act=actEl.dataset.action;
     if(act==='l1'){
-      _cmL1=actEl.dataset.grp;_managerTab=CM_ALL;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmAddOpen=false;_cmCatFilter=CM_ALL;_cmEdit=null;_cmExpanded.clear();
+      _cmL1=actEl.dataset.grp;_managerTab=CM_ALL;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmAddOpen=false;_cmCatFilter=CM_ALL;_cmEdit=null;
       renderManagerBody(_managerModule,ks());
     }else if(act==='l2'){
-      _managerTab=actEl.dataset.grp;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmAddOpen=false;_cmCatFilter=CM_ALL;_cmEdit=null;_cmExpanded.clear();
+      /* 切二级分类时保留已展开行（_cmExpanded 用稳定 rid，跨 l2 不漂移；只清勾选/批量态） */
+      _managerTab=actEl.dataset.grp;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmAddOpen=false;_cmCatFilter=CM_ALL;_cmEdit=null;
       renderManagerBody(_managerModule,ks());
     }else if(act==='cat-filter'){
-      _cmCatFilter=actEl.dataset.cat;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmEdit=null;_cmAddOpen=false;_cmExpanded.clear();
+      /* 切分类筛选时同样保留展开态，避免「换个筛选就全收起」的割裂感 */
+      _cmCatFilter=actEl.dataset.cat;_cmQuery='';_cmBatch=false;_cmChecked.clear();_cmEdit=null;_cmAddOpen=false;
       renderManagerBody(_managerModule,ks());
     }else if(act==='add-toggle'){
       _cmAddOpen=!_cmAddOpen;
@@ -6532,6 +6999,21 @@ function bindCmPane(){
       if(ta)ta.placeholder=JSON.stringify(Object.assign({},CONTENT_TYPE_MAP[el.value].fields||{}));
     }
   });
+  /* 回车提交：表单内输入框回车即添加（多行文本框回车是换行，按 Ctrl/Cmd+Enter 提交）；
+     JSON 模式文本框同样 Ctrl/Cmd+Enter 提交。搜索框回车不触发 */
+  pane.addEventListener('keydown',e=>{
+    if(e.key!=='Enter')return;
+    const panel=$('#cmAddPanel'); if(!panel)return;
+    const inForm=!!e.target.closest('#cmFormArea');
+    const inJson=e.target.id==='addJsonInput';
+    if(!inForm&&!inJson)return;
+    if(e.target.tagName==='TEXTAREA'&&!(e.ctrlKey||e.metaKey))return;
+    e.preventDefault();
+    const s=$('#cmAddType');
+    const ksArr=MODULE_CONTENT_KEYS[_managerModule]||[];
+    const key=s?s.value:(ksArr.includes(_managerTab)?_managerTab:(ksArr[0]));
+    window._addCustomItem(key,_managerModule);
+  });
 }
 /* 查重：词库条目（辨析对/待积累词）是否已存在（内置+自定义），返回重复名称列表 */
 function _dupKeys(key,obj){
@@ -6656,16 +7138,33 @@ function _pairConflict(key,obj){
   });
   return {same:[...new Set(same)],shared};
 }
-/* 添加面板重置：清空表单/输入框并刷新列表（两种录入模式通用） */
+/* 添加/合并成功后刷新：只局部重建列表区与 tab 计数（不整窗重建），保留搜索框焦点、
+   展开态、面板开启状态；随后清空表单并把焦点送回第一个输入框，方便连续录入 */
 function _cmAddReset(moduleKey){
-  if(_cmAddMode==='form'){
-    const area=$('#cmFormArea');
-    if(area)area.querySelectorAll('[data-fk],[data-w],[data-m]').forEach(el=>{el.value='';});
-  }else{
-    const input=$('#addJsonInput'); if(input)input.value='';
-  }
-  renderManagerBody(moduleKey,MODULE_CONTENT_KEYS[moduleKey]||[]);
+  const ks=MODULE_CONTENT_KEYS[moduleKey]||[];
+  const area=$('#cmListArea'); if(area)area.outerHTML=cmListAreaHtml(ks);
+  const tabs=$('#cmTabsBox'); if(tabs)tabs.outerHTML=cmTabsHtml(ks);
   render();
+  _cmClearFormFocus();
+}
+/* 清空添加表单并聚焦第一个输入框（两种录入模式通用）；连续录入时这一步让光标自动回位 */
+function _cmClearFormFocus(){
+  if(_cmAddMode==='form'){
+    const fm=$('#cmFormArea');
+    if(fm)fm.querySelectorAll('[data-fk],[data-w],[data-m]').forEach(el=>{el.value='';});
+    const first=fm?fm.querySelector('[data-fk],[data-w],[data-m]'):null;
+    if(first)setTimeout(()=>first.focus(),0);
+  }else{
+    const ta=$('#addJsonInput'); if(ta){ta.value='';setTimeout(()=>ta.focus(),0);}
+  }
+}
+/* 新条目高亮闪烁：写入后用 rid 找到刚加的那行，加一次性闪烁动画 */
+function _cmFlash(rid){
+  if(!rid)return;
+  setTimeout(()=>{
+    const row=document.querySelector('.cm-row[data-rid="'+rid+'"]');
+    if(row){row.classList.add('cm-flash');setTimeout(()=>row.classList.remove('cm-flash'),1300);}
+  },60);
 }
 /* 把内容对象写入对应分类（查重通过后调用）；obj 已确认可用 */
 function _cmAddFromObj(key,moduleKey,obj){
@@ -6757,9 +7256,13 @@ window._saveContentEdit=function(key,moduleKey){
 function _doAddCustomItem(key,moduleKey,obj){
   if(!state.customData[key])state.customData[key]=[];
   const norm=(_isPairKey(key))?_normPairObj(obj):obj;
-  state.customData[key].push(withContentId(norm));
+  const item=withContentId(norm);
+  state.customData[key].push(item);
   save();
+  /* rid 与 _cmRows 规则一致：自定义条目用内容 id（withContentId 已补） */
+  const rid=key+':c:'+(item.id!=null?item.id:('i'+(state.customData[key].length-1)));
   _cmAddReset(moduleKey);
+  _cmFlash(rid);
   toast('添加成功！');
 }
 /* 导入资料：选 JSON 文件 → 预览 → 追加到对应模块 customData */
@@ -7134,6 +7637,9 @@ function startPickRoll(finalText){
   _rollTimer=setTimeout(tick, gap[0]);
 }
 
+/* 标记待办「最后修改时间」，供跨设备同步做最后修改者胜（LWW）判先后 */
+function markTodoModified(td){ if(td&&typeof td==='object') td.mts=Date.now(); }
+
 /* 勾选待办：
    - 周期性任务：不标记完成，而是把截止日滚动到下一个周期，并记录完成次数
    - 普通任务：切换 done */
@@ -7159,6 +7665,7 @@ function toggleTodo(id){
     t.doneCount=(t.doneCount||0)+1;
     // 带截止日期的重复任务：滚动到下个周期；长期任务（无截止日）保持"长期"，不写回具体日期
     if(t.dueDate&&t.dueDate.length)t.dueDate=next;
+    markTodoModified(t);
     save();render();
     toast(`已完成 · 下次 ${next.slice(5)}（${repeatLabel(t.repeat)}）`);
     // 完成关联模块的重复待办后，自动弹出打卡录入弹窗（记笔记不产生题量，不弹）
@@ -7190,6 +7697,7 @@ function toggleTodo(id){
     t.lastDone='';
     toast('已恢复为未完成');
   }
+  markTodoModified(t);
   save();render();
 }
 /* 撤销「今天已完成」：非重复任务退回未完成；重复任务清掉今天的打卡、日期推回今天 */
@@ -7205,6 +7713,7 @@ function undoTodoDone(id){
     td.lastDone='';
   }
   const _tx=td.text.length>12?td.text.slice(0,12)+'…':td.text;
+  markTodoModified(td);
   save();render();
   toast('已撤销「'+_tx+'」，回到未完成');
 }
@@ -7329,11 +7838,17 @@ function openTargetModal(presetKey){
       if(isNaN(c)||c<1||c>500){toast('题量请输入 1-500 之间的数值');return;}
       if(!state.durTargets)state.durTargets={};
       if(!state.countTargets)state.countTargets={};
+      if(!state.durTargetsMts)state.durTargetsMts={};
+      if(!state.countTargetsMts)state.countTargetsMts={};
+      const _now=Date.now();
       state.durTargets[key]=n;state.countTargets[key]=c;
+      state.durTargetsMts[key]=_now;state.countTargetsMts[key]=_now;
     }
     if(!state.weakTargets)state.weakTargets={};
+    if(!state.weakTargetsMts)state.weakTargetsMts={};
     state.weakTargets[key]=w;
-    if(isSl){/* 申论不存时长/题量，清掉可能的历史脏值，避免速度计算误用 */if(state.durTargets)delete state.durTargets[key];if(state.countTargets)delete state.countTargets[key];}
+    state.weakTargetsMts[key]=_now||Date.now();
+    if(isSl){/* 申论不存时长/题量，清掉可能的历史脏值，避免速度计算误用 */if(state.durTargets)delete state.durTargets[key];if(state.countTargets)delete state.countTargets[key];if(state.durTargetsMts)delete state.durTargetsMts[key];if(state.countTargetsMts)delete state.countTargetsMts[key];}
     save(); closeModal(); render(); toast('目标已保存');
   });
   document.getElementById('dtClear').addEventListener('click',()=>{
@@ -7341,9 +7856,12 @@ function openTargetModal(presetKey){
     const key=sub||s;
     if(!state.weakTargets)state.weakTargets={};
     delete state.weakTargets[key];
+    if(state.weakTargetsMts)delete state.weakTargetsMts[key];
     if(!state.durTargets)state.durTargets={};
     if(!state.countTargets)state.countTargets={};
     delete state.durTargets[key]; delete state.countTargets[key];
+    if(state.durTargetsMts)delete state.durTargetsMts[key];
+    if(state.countTargetsMts)delete state.countTargetsMts[key];
     save(); closeModal(); render(); toast('已清除该目标');
   });
 }
@@ -7396,7 +7914,7 @@ function renderTodosCard(opts){
     });
     listWrap.querySelectorAll('.todo-check').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();toggleTodo(b.dataset.id);}));
     listWrap.querySelectorAll('.todo-edit').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();const td=todos.find(x=>x.id===b.dataset.id);if(td)openTodoEditor(td);}));
-    listWrap.querySelectorAll('.todo-del').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();uiConfirm('删除这条待办？',()=>{state.todos=todos.filter(x=>x.id!==b.dataset.id);save();render();},{danger:true});}));
+    listWrap.querySelectorAll('.todo-del').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();uiConfirm('删除这条待办？',()=>{state.deletedTodoIds=state.deletedTodoIds||[];if(state.deletedTodoIds.indexOf(b.dataset.id)<0)state.deletedTodoIds.push(b.dataset.id);state.todos=todos.filter(x=>x.id!==b.dataset.id);save();render();},{danger:true});}));
     listWrap.querySelectorAll('.todo-pomo').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation();const td=todos.find(x=>x.id===b.dataset.id);if(td)startPomoForTask(td);}));
   };
   const tabs=[{k:'all',l:'全部'},{k:'undone',l:'未完成'},{k:'done',l:'已完成'}];
@@ -7580,7 +8098,7 @@ function openTodoEditor(td,presetSection,preset){
     }
     const jumpType=$('#todoJumpType')?$('#todoJumpType').value:'';
     const courseId=(jumpType==='course'&&$('#todoCourse'))?($('#todoCourse').value||''):'';
-    const payload={id:isEdit?td.id:uid(),text,dueDate:due,section,sub,count,repeat,jumpType,courseId,done:isEdit?td.done:false,ts:Date.now()};
+    const payload={id:isEdit?td.id:uid(),text,dueDate:due,section,sub,count,repeat,jumpType,courseId,done:isEdit?td.done:false,ts:Date.now(),mts:Date.now()};
     if(isEdit){
       payload.doneCount=td.doneCount||0;
       payload.lastDone=td.lastDone||'';
@@ -9351,9 +9869,10 @@ function openExamEditor(id, todoId){
     });
     state.examRecords=state.examRecords||[];
     const _oldDate=r?r.date:null;
-    if(r){Object.assign(r,{date,name,score:sc,percentile:pc,type,counts,duration,modDurations,subDurations:subDurationsOut,note,rates,moduleStats});}
+    const _mts=Date.now();
+    if(r){Object.assign(r,{date,name,score:sc,percentile:pc,type,counts,duration,modDurations,subDurations:subDurationsOut,note,rates,moduleStats,mts:_mts});}
     else{
-      state.examRecords.push({id:uid(),date,name,score:sc,percentile:pc,type,counts,duration,modDurations,subDurations:subDurationsOut,note,rates,moduleStats});
+      state.examRecords.push({id:uid(),date,name,score:sc,percentile:pc,type,counts,duration,modDurations,subDurations:subDurationsOut,note,rates,moduleStats,mts:_mts});
     }
     /* 以 examRecords 为真相重建当天套卷打卡（首页今日汇总/日历详情读它：套数+加权正确率+各大类题量）；
        编辑时改了日期，新旧两天都要重算，否则旧日期残留、新日期显示 0 */
@@ -9362,7 +9881,7 @@ function openExamEditor(id, todoId){
     // 关联任务：保存套卷成绩即标记该待办完成（取消则任务保持未做、仍在列表）
     if(todoId){
       const _td=(state.todos||[]).find(x=>x.id===todoId);
-      if(_td && !_td.done){ _td.done=true; _td.lastDone=todayStr(); }
+      if(_td && !_td.done){ _td.done=true; _td.lastDone=todayStr(); markTodoModified(_td); }
     }
     save();closeModal();render();toast('已保存');
   });
