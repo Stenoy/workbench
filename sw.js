@@ -1,4 +1,4 @@
-/* 上岸工作台 Service Worker —— 离线可用 + 自动更新
+/* 云工作台 Service Worker —— 离线可用 + 自动更新
  * 策略：导航请求 network-first（保证每次拿到最新页面），
  *       静态资源 cache-first（图标/清单离线缓存）。
  * 改线上 index.html 后，用户下次打开即自动更新。
