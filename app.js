@@ -131,7 +131,7 @@ function migrateTodos(){
   if(!state.countTargets)state.countTargets={};
   if(!Array.isArray(state.courses))state.courses=[];   // 课程（听课进度）
   if(!Array.isArray(state.deletedTodoIds))state.deletedTodoIds=[]; // 跨设备删除同步：记录已删待办 id
-  migrateCourseDone();   // 老数据 done 仅计数 → 补上「第几讲」编号
+  const courseDoneChanged=migrateCourseDone();   // 老数据 done 仅计数 → 补上「第几讲」编号
   if(Array.isArray(state.todos)){
     // 数组形态：补齐缺失字段，丢弃无效项
     let changed=false;
@@ -148,7 +148,7 @@ function migrateTodos(){
       arr.push(item);
     });
     state.todos=arr;
-    if(changed)save(true);
+    if(changed||courseDoneChanged)save(true);
     return;
   }
   // 对象形态（旧版）：展开合并成数组
@@ -1967,7 +1967,7 @@ function syncTimetableTodos(silent){
       text:c.name+' 第'+next+(course.type==='brush'?'章':'讲'),
       dueDate:t,
       section:course.section||c.module||'',
-      sub:'', count:0, repeat:'', jumpType:'course', courseId:course.id,
+      sub:'', count:0, repeat:{type:'none'}, jumpType:'course', courseId:course.id,
       done:false, ts:Date.now(), mts:Date.now(), autoTt:c.id
     });
     made++;
@@ -2267,15 +2267,19 @@ function findCourse(id){ return (Array.isArray(state.courses)?state.courses:[]).
 /* 迁移：老数据 done 是 [{id,ts,date}] 纯计数，没有「第几讲」编号。
    补成 [{n,ts,date}]：旧数据按顺序补 1..k；已带 n 的保留；同号去重 */
 function migrateCourseDone(){
+  let changed=false;
   (state.courses||[]).forEach(function(c){
     if(!c)return;
-    if(!Array.isArray(c.done)){c.done=[];return;}
+    if(!Array.isArray(c.done)){if(c.done!==undefined){c.done=[];changed=true;}return;}
+    const before=JSON.stringify(c.done);
     if(c.done.length && c.done.every(function(d){return d&&typeof d.n!=='number';})){
       c.done=c.done.map(function(d,i){return {n:i+1,ts:d.ts||Date.now(),date:d.date||todayStr()};});
     }
     c.done.forEach(function(d,i){ if(d&&typeof d.n!=='number')d.n=i+1; });
     const seen={}; c.done=c.done.filter(function(d){ if(!d||seen[d.n])return false; seen[d.n]=1; return true; });
+    if(JSON.stringify(c.done)!==before)changed=true;
   });
+  return changed;
 }
 /* 该课程已听完的讲号集合 */
 function courseDoneSet(c){ return new Set((c.done||[]).map(function(d){return d.n;}).filter(function(n){return typeof n==='number';})); }
@@ -2529,7 +2533,15 @@ function courseFormModal(id,prefill){
     const type=box.querySelector('#cfType').value==='brush'?'brush':'listen';
     const total=Math.max(0,parseInt(box.querySelector('#cfTotal').value||'0',10)||0);
     if(!Array.isArray(state.courses))state.courses=[];
-    if(c){c.name=name;c.teacher=teacher;c.section=section;c.type=type;c.total=total;c.mts=Date.now();}
+    if(c){
+      c.name=name;c.teacher=teacher;c.section=section;c.type=type;c.total=total;c.mts=Date.now();
+      // 总讲数改小：裁掉超范围的听讲记录（否则讲义弹窗只渲 1..total，超范围记录变无法取消的幽灵数据），并写墓碑同步到对端
+      if(total>0 && Array.isArray(c.done) && c.done.some(d=>d&&d.n>total)){
+        const dropped=c.done.filter(d=>d&&d.n>total).map(d=>d.n);
+        c.done=c.done.filter(d=>d&&d.n<=total);
+        if(dropped.length)markEntityDeleted('lesson:'+c.id, dropped);
+      }
+    }
     else state.courses.push({id:uid(),name:name,teacher:teacher,section:section,type:type,total:total,createdAt:Date.now(),mts:Date.now(),done:[]});
     save();closeModal();toast(c?'已保存':(type==='brush'?'已添加练习册':'已添加课程'));render();
   };
@@ -6282,6 +6294,7 @@ function doImport(data){
   const localTodos=Array.isArray(state.todos)?state.todos.slice():[];
   const localTT=Array.isArray(state.timetable)?state.timetable.slice():[];
   const localExams=Array.isArray(state.exams)?state.exams.slice():[];
+  const localCourses=Array.isArray(state.courses)?state.courses.slice():[];
   const localCustom={};
   Object.keys(state.customData||{}).forEach(k=>{
     if(Array.isArray(state.customData[k]))localCustom[k]=state.customData[k].slice();
@@ -6309,7 +6322,7 @@ function doImport(data){
   }
   // 待合并字段先剔除，避免被整体覆盖
   const plain=Object.assign({},data);
-  delete plain.todos;delete plain.customData;delete plain.timetable;
+  delete plain.todos;delete plain.customData;delete plain.timetable;delete plain.courses;
   state=Object.assign(state,plain,{version:DATA_VERSION});
   // 兜底：对象型字段用 {}，数组型字段用 []。
   // 注意 todos 是数组，误赋 {} 会让后续 (state.todos||[]).filter 抛 TypeError 导致白屏
@@ -6367,6 +6380,15 @@ function doImport(data){
   if(data.ttTodoLog&&typeof data.ttTodoLog==='object'&&!Array.isArray(data.ttTodoLog)){
     if(!state.ttTodoLog||typeof state.ttTodoLog!=='object'||Array.isArray(state.ttTodoLog))state.ttTodoLog={};
     Object.keys(data.ttTodoLog).forEach(function(k){ if(state.ttTodoLog[k]==null)state.ttTodoLog[k]=data.ttTodoLog[k]; });
+  }
+  /* 课程按 id 并集合并：同 id 的课程保留本地（含已听进度），导入里的新 id 追加。
+     修复：原来 courses 没从 plain 剔除，Object.assign 会用导入数据整体覆盖本地课程，
+     导致本地已听进度丢失。done 数组不做并集（导入备份的 done 可能是旧的），以本地为准。 */
+  const importCourses=Array.isArray(data.courses)?data.courses.filter(c=>c&&c.id):[];
+  if(importCourses.length){
+    const localIds=new Set(localCourses.map(c=>c&&c.id).filter(Boolean));
+    const newCourses=importCourses.filter(c=>!localIds.has(c.id));
+    if(newCourses.length)state.courses=(state.courses||[]).concat(newCourses);
   }
   // 考试定义按 key 并集：导入文件若只含旧数据，本地新增的自定义考试不会被覆盖丢失
   if(localExams.length&&Array.isArray(state.exams)){
