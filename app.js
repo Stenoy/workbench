@@ -3257,16 +3257,30 @@ function secHasTimeLimit(sec){return sec!=='chendu';}
    优先级：子模块目标 → 大类目标 → null（表示按历史均值自动，不预设）。
    key 命名：大类用 SECTION_MAP 键（yanyu…），子模块用 EXAM_TYPES 子键（言语_逻辑填空…），
    统一存进 state.durTargets，与正确率目标 state.weakTargets 互不影响。 */
+/* 子模块显示名 → 目标 key（EXAM 子键，如 言语_逻辑填空）：目标是按 key 存的，
+   而录入记录里存的是显示名（逻辑填空），查目标前必须统一；已是 key 则原样返回。
+   不统一会导致子模块时长/题量目标静默失效、超时判定退化成大类目标。 */
+function durSubKey(section,sub){
+  if(!sub)return sub;
+  const list=subsOfSection(section)||[];
+  for(let i=0;i<list.length;i++)if(list[i].key===sub)return sub;
+  for(let i=0;i<list.length;i++)if(list[i].name===sub)return list[i].key;
+  return sub;
+}
 function resolveDurTarget(section,sub){
   const dt=(state&&state.durTargets)||{};
-  if(sub&&dt[sub]!=null)return dt[sub];
+  const sk=durSubKey(section,sub);
+  if(sk&&dt[sk]!=null)return dt[sk];
+  if(sub&&sub!==sk&&dt[sub]!=null)return dt[sub];
   if(section&&dt[section]!=null)return dt[section];
   return null;
 }
 /* 解析某实体（大类 section + 可选子模块 sub）的目标题量（题）。key 规则同 resolveDurTarget。 */
 function resolveCountTarget(section,sub){
   const ct=(state&&state.countTargets)||{};
-  if(sub&&ct[sub]!=null)return ct[sub];
+  const sk=durSubKey(section,sub);
+  if(sk&&ct[sk]!=null)return ct[sk];
+  if(sub&&sub!==sk&&ct[sub]!=null)return ct[sub];
   if(section&&ct[section]!=null)return ct[section];
   return null;
 }
@@ -4777,7 +4791,10 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   }
   const title=(t.sub?subName(t.sub):SECTION_MAP[t.sec].name);
   const isSplit=!t.sub && splitSubEntries(t.sec).length>0;
-  const sv=(stat.subs&&stat.subs[t.sub])||{count:0,rate:0};
+  /* 记录里 sub 存的是显示名（逻辑填空），而待办/目标用 EXAM 子键（言语_逻辑填空）。
+     读 subs 时两种写法都要认，否则子模块待办永远显示「今日已录 0」、不出现覆盖按钮、预填重复累加。 */
+  const _subAlias=t.sub?[t.sub,subName(t.sub)||t.sub]:[];
+  const sv=(_subAlias.reduce((a,k)=>a||(stat.subs&&stat.subs[k]),null))||{count:0,rate:0};
   /* 关联待办题量预填：任务关联了子模块/大类并设了题量时，录成绩自动带入（可改，不锁定）。
      收集规则：同 sec、未 done、非「重复任务今天已打勾」的待办；子模块待办按 subName 存（待办 sub 是「言语_逻辑填空」，
      拆分行 key 是「逻辑填空」，统一用 subName 桥接），整体待办存 __overall__。 */
@@ -4912,7 +4929,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   };
   // —— 分批次录入（同子模块多笔，如 10+5+5）：开关 + 批量行，复用原 rep- 样式 ——
   const _batchRowHtml=(idxb,countVal,rateVal,minVal)=>`<div class="batch-row" data-batch-idx="${idxb}">
-      <div class="batch-row-head"><span>第 ${idxb} 笔</span><button type="button" class="batch-del" aria-label="删除本笔">×</button></div>
+      <div class="batch-row-head"><span>第 ${idxb} 笔</span><button type="button" class="batch-del" aria-label="删除本笔" style="display:none">×</button></div>
       <div class="rep-hero-grid${dsNeedRate?'':' two'}">
         <div class="rep-field"><label class="rep-label">本次题量<i class="req">*</i></label><div class="rep-input"><input type="number" class="field rep-num b-count" min="0" inputmode="numeric" placeholder="题量" value="${countVal||''}"><span class="rep-suffix">${dsUnit}</span></div></div>
         ${dsNeedRate?`<div class="rep-field"><label class="rep-label">本次正确率<i class="req">*</i></label><div class="rep-input"><input type="text" class="field rep-num b-rate" inputmode="text" placeholder="70 或 14/20" value="${rateVal||''}"><span class="rep-suffix">%</span></div></div>`:''}
@@ -4951,7 +4968,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   } else {
     const subList=splitSubEntries(t.sec);
     const subRows=subList.map(s=>{
-      const sub=(stat.subs&&stat.subs[s.key])||{count:0,rate:0};
+      const sub=(stat.subs&&(stat.subs[s.key]||stat.subs[s.name]))||{count:0,rate:0};
       const done=(sub.count>0)?`<span class="rep-sub-done">已录${sub.count}</span>`:'';
       const prefill=isAdd?(_todoPrefill(s.key, sub.count)||''):(sub.count||'');
       const single=`<div class="sub-single">
@@ -5000,7 +5017,10 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   document.querySelectorAll('.rep-rec-del').forEach(b=>b.addEventListener('click',function(){
     const i=parseInt(b.dataset.ri,10);
     const dd=todayStr();const st=state.dailyStats[dd]&&state.dailyStats[dd][t.sec];
-    if(st&&st.records){st.records.splice(i,1);recomputeDailyStat(t.sec,dd);if(!st.records.length)delete state.dailyStats[dd][t.sec];if(Object.keys(state.dailyStats[dd]||{}).length===0)delete state.dailyStats[dd];save();render();openTaskReport(t, dsMode, _completeTodoId);}
+    if(st&&st.records){const _rm=st.records[i]||{};st.records.splice(i,1);
+      // 删掉一条记录同时扣掉它的时长，否则分批/拆分录入后删笔，模块时长仍虚高
+      if(_rm.min>0){st.minutes=Math.max(0,(st.minutes||0)-_rm.min);if(st.minutes<=0)delete st.minutes;}
+      recomputeDailyStat(t.sec,dd);if(!st.records.length)delete state.dailyStats[dd][t.sec];if(Object.keys(state.dailyStats[dd]||{}).length===0)delete state.dailyStats[dd];save();render();openTaskReport(t, dsMode, _completeTodoId);}
   }));
   // 查看详情里的「改」：编辑单条记录（预填回录入框，原地替换该条）
   document.querySelectorAll('.rep-rec-edit').forEach(b=>b.addEventListener('click',function(){
@@ -5023,22 +5043,24 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   const _btEl=document.getElementById('batchToggle');
   if(_btEl){
     const _renum=()=>{const rs=document.querySelectorAll('#batchRows .batch-row');rs.forEach((r,i)=>{const sp=r.querySelector('.batch-row-head span');if(sp)sp.textContent='第 '+(i+1)+' 笔';const dl=r.querySelector('.batch-del');if(dl)dl.style.display=rs.length>1?'':'none';});_batchRecompute();};
-    _btEl.addEventListener('change',()=>{const on=_btEl.checked;const sw=document.getElementById('singleWrap');const bw=document.getElementById('batchWrap');if(sw)sw.style.display=on?'none':'';if(bw)bw.style.display=on?'':'none';if(on){if(document.querySelectorAll('#batchRows .batch-row').length===0){const cont=document.getElementById('batchRows');if(cont)cont.insertAdjacentHTML('beforeend',_batchRowHtml(1,(_lockCount>0?_lockCount:''),'', pomoMin||''));_renum();}}else{const _bc=document.getElementById('dsCount');if(_bc&&!_bc.readOnly)_bc.focus();}});
+    _btEl.addEventListener('change',()=>{const on=_btEl.checked;const sw=document.getElementById('singleWrap');const bw=document.getElementById('batchWrap');if(sw)sw.style.display=on?'none':'';if(bw)bw.style.display=on?'':'none';if(on){if(document.querySelectorAll('#batchRows .batch-row').length===0){const cont=document.getElementById('batchRows');if(cont)cont.insertAdjacentHTML('beforeend',_batchRowHtml(1,(_lockCount>0?_lockCount:''),'',''));_renum();}}else{const _bc=document.getElementById('dsCount');if(_bc&&!_bc.readOnly)_bc.focus();}});
     const _addB=document.getElementById('batchAddBtn');
-    if(_addB)_addB.addEventListener('click',()=>{const cont=document.getElementById('batchRows');if(!cont)return;const n=cont.querySelectorAll('.batch-row').length+1;cont.insertAdjacentHTML('beforeend',_batchRowHtml(n,'','', pomoMin||''));_renum();});
+    // 新加的笔不预填番茄钟时长：pomoMin 是「本次」的时长，只属于第一笔，重复预填会让合计翻倍
+    if(_addB)_addB.addEventListener('click',()=>{const cont=document.getElementById('batchRows');if(!cont)return;const n=cont.querySelectorAll('.batch-row').length+1;cont.insertAdjacentHTML('beforeend',_batchRowHtml(n,'','',''));_renum();});
     // 事件委托：删除按钮 + 输入监听（处理动态新增行）
     const _batchWrap=document.getElementById('batchWrap');
     if(_batchWrap){
-      _batchWrap.addEventListener('click',(e)=>{const btn=e.target.closest('.batch-del');if(!btn)return;const row=btn.closest('.batch-row');if(row)row.remove();_renum();});
+      _batchWrap.addEventListener('click',(e)=>{const btn=e.target.closest('.batch-del');if(!btn)return;const row=btn.closest('.batch-row');if(!row)return;if(document.querySelectorAll('#batchRows .batch-row').length<=1){toast('至少保留一笔，不需要可关掉「分批」');return;}row.remove();_renum();});
       _batchWrap.addEventListener('input',()=>{_batchRecompute();});
     }
     // 分批模式实时汇总
     const _batchRecompute=()=>{
       const prev=document.getElementById('batchPreview');if(!prev)return;
-      let sumC=0,sumMin=0,sw=0,has=false;
+      let sumC=0,sumMin=0,sw=0,has=false,filled=0;
       document.querySelectorAll('#batchRows .batch-row').forEach(r=>{
         const c=Math.max(0,parseInt(r.querySelector('.b-count').value,10)||0);
         if(c<=0)return;
+        filled++;
         const rInp=r.querySelector('.b-rate');
         const rp=dsNeedRate?parseRateInput(rInp?rInp.value:''):null;
         const rt=(rp&&rp.valid)?rp.rate:0;
@@ -5048,7 +5070,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
       });
       if(has){
         const avg=dsNeedRate&&sumC>0?Math.round(sw/sumC):null;
-        const parts=['已填 '+document.querySelectorAll('#batchRows .batch-row').length+' 笔'];
+        const parts=['已填 '+filled+' 笔'];
         parts.push('合计 '+sumC+' '+dsUnit);
         if(avg!=null)parts.push('平均正确率 '+avg+'%');
         parts.push('合计 '+sumMin+' 分钟');
@@ -5181,6 +5203,9 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
       _rec2.records.splice(editIdx,1);
       const _bkKeep=editRec.bkId?{bkId:editRec.bkId,bkN:(editRec.bkN==null?null:editRec.bkN)}:{};
       _rec2.records.push(Object.assign({sub:editRec.sub,count:count,rate:dsNeedRate?rate:null,min:_newMin,ts:Date.now()},_bkKeep));
+      // 改时长要同步模块总时长（原来只改记录不改 minutes，改完今日时长不变）
+      const _delta=_newMin-(editRec.min||0);
+      if(_delta){_rec2.minutes=Math.max(0,(_rec2.minutes||0)+_delta);if(_rec2.minutes<=0)delete _rec2.minutes;}
       recomputeDailyStat(t.sec,d);
       if(!_rec2.records.length)delete state.dailyStats[d][t.sec];
       if(Object.keys(state.dailyStats[d]).length===0)delete state.dailyStats[d];
@@ -5214,6 +5239,8 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     if(batchOn){
       // —— 分批次录入：同子模块分多笔（如 10+5+5），每笔各自 题量/正确率/学习时长 ——
       const rows=[].slice.call(document.querySelectorAll('#batchRows .batch-row'));
+      /* 一笔都没有时必须拦住：否则 newRecs=[] 会走完收尾，覆盖模式下等于把当天记录清空 */
+      if(!rows.length){toast('请先点「+ 再加一笔」填写题量');return;}
       let _sumC=0,_totMin=0,_bad=false;
       rows.forEach(function(row,i){
         const c=Math.max(0,parseInt(row.querySelector('.b-count').value,10)||0);
@@ -5352,12 +5379,22 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     seedRecordsIfLegacy(rec);
     if(!rec.records)rec.records=[];
     const _oldMin=rec.minutes||0;
-    rec.minutes = isAdd?(_oldMin+_newMin):_newMin;
-    if(rec.minutes<=0)delete rec.minutes;
-    // 覆盖模式：大类(含拆分模块)整段替换当天该模块记录；子模块任务只替换该子模块
+    /* 覆盖模式：大类(含拆分模块)整段替换当天该模块记录；子模块任务只替换该子模块。
+       记录里 sub 存显示名、t.sub 是 EXAM 子键，必须用别名双向比对，
+       否则旧记录删不掉（覆盖变追加，题量重复累计）。 */
+    let _removedMin=0;
     if(!isAdd){
-      rec.records= t.sub ? rec.records.filter(r=>r.sub!==t.sub) : [];
+      if(t.sub){
+        rec.records=rec.records.filter(r=>{
+          if(_subAlias.indexOf(r.sub)>=0){_removedMin+=(r.min||0);return false;}
+          return true;
+        });
+      }else rec.records=[];
     }
+    /* 时长口径：追加=今日累计+本次；子模块覆盖=保留其他子模块时长再换成本次；整体覆盖=直接取本次 */
+    const _baseMin = isAdd ? _oldMin : (t.sub ? Math.max(0,_oldMin-_removedMin) : 0);
+    rec.minutes = _baseMin + _newMin;
+    if(rec.minutes<=0)delete rec.minutes;
     // 拆分模块追加子模块明细时：旧的「整体(sub:null)」记录与子模块明细重复（整体框=子模块汇总），
     // 若保留会虚高（30整体 + 20+10子模块 = 60）。本次生成的差量记录(overall>subSum)不受影响。
     if(isSplit && isAdd && newRecs.some(r=>r.sub)){
