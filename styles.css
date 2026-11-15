@@ -1967,12 +1967,9 @@ select:disabled{opacity:0.5;cursor:not-allowed;}
 /* 套卷弹窗吸底操作栏 */
 .exam-actions{position:sticky;bottom:0;display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:10px 0;margin-top:4px;background:linear-gradient(to top,#fff 80%,rgba(255,255,255,0));z-index:1;}
 
-/* 课程页添加按钮 + 练习册卡片一键加入今日任务 */
+/* 课程页添加按钮 */
 .course-add{display:flex;gap:8px;}
 .course-add .btn{flex:1 1 0;width:auto;min-width:0;}
-/* 练习册卡片：一键加入今日任务（独立整行，不挤进度按钮；手机端点按区≥46px） */
-.course-bk-add{margin-top:8px;}
-.course-bk-add .btn{width:100%;min-height:46px;font-size:14px;font-weight:600;}
 
 /* 练习册卡片：整本成绩汇总行 + 可展开的按章明细 */
 .bk-stat{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 8px;padding:9px 11px;border-radius:10px;background:var(--primary-soft);font-size:12px;color:var(--text-sub);min-height:44px;cursor:pointer;touch-action:manipulation;}

@@ -17,6 +17,10 @@ let dirtySincePush=false;
 let lastPush=0;
 const AUTO_PUSH_DEBOUNCE=2*60*1000;
 const AUTO_PULL_INTERVAL=30*1000;
+/* 数据页「刷题记录」展开全部状态：render() 重建整个面板时不能丢（放文件顶部防 TDZ） */
+let _examLogExpanded=false;
+/* 数据页「薄弱考点」里展开的子模块：裸 render()（编辑成绩/存删套卷/云同步）也要能恢复 */
+let _autoExpanded=[];
 
 /* 规范词分类改版（2026-09-10）：旧分类 → 新分类。只改 cat，不删任何一条自己加的词。
    放在文件顶部：迁移在初始化早期就被调用，const 声明在后面会触发 TDZ 白屏 */
@@ -121,6 +125,79 @@ function loadData(){
   }
   return base;
 }
+/* 数值归一：导入旧备份 / 另一端老数据里，题量、正确率、时长可能是字符串（'10'），
+   直接参与 + 运算会变成字符串拼接（「0010题」、6045 分钟），缺字段还会算出 NaN%。
+   只改「本来就该是数字」的字段：rate=null（未填正确率）保留，其余数据一律不动。 */
+function numOr(v,def){
+  if(v==null||v==='')return def;
+  const n=Number(v);
+  return isFinite(n)?n:def;
+}
+function normalizeStats(){
+  let changed=false;
+  const fix=function(o,k,def,keepNull){
+    if(!o||typeof o!=='object')return;
+    const v=o[k];
+    if(v===undefined)return;
+    if(v===null){if(!keepNull){o[k]=def;changed=true;}return;}
+    if(typeof v==='number'&&isFinite(v))return;
+    const n=Number(v);
+    if(isFinite(n)){o[k]=n;changed=true;}
+    else{o[k]=keepNull?null:def;changed=true;}
+  };
+  const fixGroup=function(g){
+    if(!g||typeof g!=='object')return;
+    fix(g,'count',0);fix(g,'rate',null,true);fix(g,'minutes',0);
+    if(g.subs&&typeof g.subs==='object')Object.keys(g.subs).forEach(function(k){fixGroup(g.subs[k]);});
+    if(Array.isArray(g.records))g.records.forEach(function(r){
+      if(!r||typeof r!=='object')return;
+      fix(r,'count',0);fix(r,'rate',null,true);fix(r,'min',0);fix(r,'ts',0);fix(r,'ets',0);
+    });
+  };
+  /* 课程/练习册也归一：老存档或导入备份里 total、讲号可能是字符串。
+     total 字符串会让「目标共 N 讲」拼成 01020；讲号字符串会被当成没听、还被迁移改成第1讲。 */
+  if(Array.isArray(state.courses))state.courses.forEach(function(c){
+    if(!c||typeof c!=='object')return;
+    fix(c,'total',0);
+    [c.done,c.archivedDone].forEach(function(arr){
+      if(!Array.isArray(arr))return;
+      arr.forEach(function(d){if(d&&typeof d==='object'){fix(d,'n',0);fix(d,'ts',0);}});
+    });
+  });
+  const ds=state.dailyStats;
+  if(ds&&typeof ds==='object'){
+    Object.keys(ds).forEach(function(d){
+      if(!ds[d]||typeof ds[d]!=='object'){ds[d]={};changed=true;return;}
+      Object.keys(ds[d]).forEach(function(sec){fixGroup(ds[d][sec]);});
+    });
+  }
+  if(Array.isArray(state.examRecords)){
+    const clean=state.examRecords.filter(function(r){return r&&typeof r==='object';});
+    if(clean.length!==state.examRecords.length){state.examRecords=clean;changed=true;}
+    state.examRecords.forEach(function(r){
+      fix(r,'score',null,true);fix(r,'percentile',null,true);fix(r,'duration',null,true);
+      const ms=r.moduleStats;
+      if(ms&&typeof ms==='object')Object.keys(ms).forEach(function(k){
+        const m=ms[k];if(!m||typeof m!=='object')return;
+        fix(m,'total',0);fix(m,'correct',0);
+        if(m.subs&&typeof m.subs==='object')Object.keys(m.subs).forEach(function(sk){
+          const s=m.subs[sk];if(!s||typeof s!=='object')return;
+          fix(s,'total',0);fix(s,'correct',0);
+        });
+      });
+      if(r.counts&&typeof r.counts==='object')Object.keys(r.counts).forEach(function(k){
+        const c=r.counts[k];if(!c||typeof c!=='object')return;
+        fix(c,'total',0);fix(c,'correct',0);
+      });
+    });
+  }
+  const sr=state.studyRecords;
+  if(sr&&typeof sr==='object')Object.keys(sr).forEach(function(d){
+    const rec=sr[d];if(!rec||!Array.isArray(rec.sessions))return;
+    rec.sessions.forEach(function(s){if(s&&typeof s==='object'){fix(s,'duration',0);fix(s,'overtimeMin',0);}});
+  });
+  return changed;
+}
 /* 待办迁移：
    1) 现版本 todos 是数组 [{id,text,dueDate,section,repeat,done,ts}]
    2) 旧版本是按日期分组的对象 {date:[{id,text,done}]} —— 需展开并补 dueDate
@@ -208,18 +285,21 @@ function migrateHealTaojuan(){
       if(!need)return;
       var tot=0,cor=0,minSum=0,subs={};
       recs.forEach(function(rc){
-        minSum+=(rc.duration||0);
-        var ms=rc.moduleStats||{};
+        minSum+=numOr(rc&&rc.duration,0);
+        var ms=(rc&&rc.moduleStats)||{};
         Object.keys(ms).forEach(function(k){
-          var m=ms[k];if(!m||!(m.total>0))return;
-          tot+=m.total;cor+=(m.correct||0);
+          var m=ms[k];if(!m)return;
+          var mt=numOr(m.total,0);if(!(mt>0))return;
+          var mc=numOr(m.correct,0);
+          tot+=mt;cor+=mc;
           var nm=NAME[k]||k;
           if(!subs[nm])subs[nm]={count:0,correct:0};
-          subs[nm].count+=m.total;subs[nm].correct+=(m.correct||0);
+          subs[nm].count+=mt;subs[nm].correct+=mc;
         });
       });
       Object.keys(subs).forEach(function(k){var s=subs[k];s.rate=s.count>0?Math.round(s.correct/s.count*100):0;});
-      var stat={count:recs.length,rate:tot>0?Math.round(cor/tot*100):0,subs:subs,records:[]};
+      /* 没录各模块题数时不写假的 0%（首页/日历详情会显示「1 套 · 0%」），留空显示「—」 */
+      var stat={count:recs.length,rate:tot>0?Math.round(cor/tot*100):null,subs:subs,records:[]};
       if(minSum>0)stat.minutes=Math.round(minSum*10)/10;
       if(!state.dailyStats[d])state.dailyStats[d]={};
       state.dailyStats[d].taojuan=stat;
@@ -480,6 +560,9 @@ function migrateFujianExamDate(){
   }
 }
 ensureArrayList();
+/* 启动尾声统一做一次数值归一：老存档 / 云端导入里的字符串数字在这里变成真数字，
+   后面所有统计、图表、卡片拿到的都是干净值（只改类型，不改任何成绩）。 */
+if(normalizeStats())save(true);
 /* 参与打卡显示的分类（用户可在「今日汇总 → 分类」里勾选） */
 function activeCheckinCategories(){
   const hidden=Array.isArray(state.checkinHidden)?state.checkinHidden:[];
@@ -546,6 +629,38 @@ function save(skipSync){
   }
 }
 function fmtTime(d){var h=d.getHours(),m=d.getMinutes();return (h<10?'0':'')+h+':'+(m<10?'0':'')+m;}
+
+/* 课程讲号全集：done（当前总讲数范围内）+ archivedDone（总讲数改小时暂存的讲）。
+   改总讲数、两端合并后都按最终 total 重新归位，手滑把 30 改成 3 再改回来进度也不会丢。
+   lm 是用户主动「撤销一讲」的墓碑，只有这种撤销才该真删记录。 */
+function reconcileCourseDone(c,lm){
+  if(!c)return c;
+  const all=new Map();
+  [].concat(c.done||[],c.archivedDone||[]).forEach(function(d){
+    if(!d||d.n==null)return;
+    const n=Number(d.n);if(!isFinite(n)||n<1)return;
+    const o={n:n,ts:d.ts||0,date:d.date||todayStr()};
+    const ex=all.get(n);if(!ex||o.ts>ex.ts)all.set(n,o);
+  });
+  const tt=numOr(c.total,0),done=[],arch=[];
+  all.forEach(function(d){
+    const dt=lm&&lm.get(d.n);
+    if(dt!=null&&dt>(d.ts||0))return;
+    (tt>0&&d.n>tt?arch:done).push(d);
+  });
+  c.done=done;c.archivedDone=arch;
+  return c;
+}
+/* 课程每个字段各自的修改时间：两端同时改同一门课的不同字段时，逐字段取较新，不再整对象覆盖 */
+const COURSE_LWW_FIELDS=['name','teacher','section','type','total','note'];
+function courseFieldTs(c,f){
+  if(!c)return 0;
+  if(c.fMts&&typeof c.fMts==='object'){
+    if(c.fMts[f])return c.fMts[f];
+    return c.createdAt||0;   // 新版数据里没单独记时间的字段 = 创建后没改过
+  }
+  return c.mts||c.createdAt||0;   // 老数据没有 fMts：整体 mts 当作最后一次编辑时间
+}
 
 /* ---------- 带重试的网络请求 ---------- */
 function fetchWithRetry(url,options,retryCount){
@@ -674,6 +789,14 @@ function arrayUnionById(localArr,remoteArr){
          custom:<内容类型> / lesson:<课程id>
    规则与待办墓碑一致：仅当「删除时间 > 实体最后修改时间」才删，
    这样删掉后同 id 重建的实体不会被旧墓碑误杀。 */
+/* 单条刷题记录的稳定身份：新记录用 rid；老记录退化为 ts|sub（trea 的编辑逻辑保留 ts，身份不变）。
+   ts=0 的老旧反推记录没有可靠身份 → 返回 null，不记墓碑（避免误杀同批其它记录）。 */
+function recDelKey(r){
+  if(!r)return null;
+  if(r.rid)return 'rid:'+r.rid;
+  if(r.ts>0)return 'ts:'+r.ts+'|'+(r.sub||'__overall__');
+  return null;
+}
 function entityDelMap(kind,A,B){
   const pick=function(s){return (s&&s.deletedEntities&&Array.isArray(s.deletedEntities[kind]))?s.deletedEntities[kind]:[];};
   const m=new Map();
@@ -703,6 +826,32 @@ function markEntityDeleted(kind,ids){
   const ts=Date.now();
   (ids||[]).forEach(function(id){if(id!=null)m.set(id,Math.max(m.get(id)||0,ts));});
   state.deletedEntities[kind]=entityDelArray(m);
+}
+/* 删掉的练习册：历史成绩记录上的 bkId / bkN 只是「挂在哪本册子」的标记，册子删了就悬空了。
+   本地删册会清一遍，但另一端同步 / 导入旧备份还会把带 bkId 的旧记录带回来。
+   这里按「课程删除墓碑」统一摘掉标记：题量 / 正确率 / 时长 / ts / rid 一概不动，真实成绩不丢。
+   ets 取删除时间（不抬高到当前时间），既让「清过标记」这版在旧记录面前胜出，
+   又不会盖住删册之后对同一条成绩的更新编辑。 */
+function stripDeadBookletRefs(target,delMap){
+  const ds=target&&target.dailyStats;
+  if(!ds||typeof ds!=='object'||!delMap||!delMap.size)return 0;
+  const now=Date.now();
+  let n=0;
+  Object.keys(ds).forEach(function(d){
+    const day=ds[d];if(!day||typeof day!=='object')return;
+    Object.keys(day).forEach(function(sec){
+      const s=day[sec];if(!s||!Array.isArray(s.records))return;
+      s.records.forEach(function(r){
+        if(!r||r.bkId==null||!delMap.has(r.bkId))return;
+        const dt=delMap.get(r.bkId);
+        const t=(typeof dt==='number'&&isFinite(dt))?dt:now;
+        delete r.bkId;delete r.bkN;
+        r.ets=Math.max(r.ets||0,t);
+        n++;
+      });
+    });
+  });
+  return n;
 }
 /* 通用实体合并：按 id 并集 + 同 id 取时间戳较新（special 可自定义）+ 墓碑过滤 */
 function mergeEntities(localArr,remoteArr,delMap,idOf,tsOf,special){
@@ -800,7 +949,8 @@ function mergeTodosLWW(local,remote,delMap){
       sgSeen.set(sk,x);
     }
     if(x.autoTt&&x.courseId&&x.dueDate){
-      const key=x.courseId+'@'+x.dueDate, p=seen.get(key);
+      /* 去重键用课表条目 id（autoTt）：同一门课一天两节各有各的自动待办，按 courseId 会把第二节吞掉 */
+      const key=(x.autoTt||x.courseId)+'@'+x.dueDate, p=seen.get(key);
       if(p){
         const better=(String(x.id||'').indexOf('tt_')===0)?x:(String(p.id||'').indexOf('tt_')===0)?p:((x.mts||0)>=(p.mts||0)?x:p);
         const i=res.findIndex(o=>o.id===p.id); if(i>=0)res[i]=better;
@@ -841,7 +991,7 @@ function applyRemoteMerge(remote,remoteTs){
   const L=state,R=remote;
   const localHolds=function(o){return o&&typeof o==='object'&&!Array.isArray(o)&&Object.keys(o).length>0;};
   // —— 通用实体墓碑：先合并两端记录，供下面各实体合并时过滤 ——
-  const entSet=new Set(['course','timetable','examRecord','shenlunReview','exam','session']);
+  const entSet=new Set(['course','timetable','examRecord','shenlunReview','exam','session','brec']);
   [L.customData,R.customData].forEach(function(cd){Object.keys(cd||{}).forEach(function(k){entSet.add('custom:'+k);});});
   [L.courses,R.courses].forEach(function(arr){(Array.isArray(arr)?arr:[]).forEach(function(c){if(c&&c.id!=null)entSet.add('lesson:'+c.id);});});
   if(!L.deletedEntities||typeof L.deletedEntities!=='object'||Array.isArray(L.deletedEntities))L.deletedEntities={};
@@ -879,16 +1029,54 @@ function applyRemoteMerge(remote,remoteTs){
       Object.keys(rd).forEach(function(sec){
         const rv=rd[sec];if(!rv||typeof rv!=='object')return;
         const lv=L.dailyStats[d][sec];
-        if(!lv){L.dailyStats[d][sec]=JSON.parse(JSON.stringify(rv));return;} // 本地没有该模块统计才补
+        /* 本地没有该模块统计才补。但不能直接整块复制：本地把这一天的记录全删光时
+           该 sec 会被删掉，对端旧记录会从这里绕过下面的 brec 墓碑过滤复活。
+           先反推出稳定的 rid（两端可复现），按墓碑过滤，全被删过就干脆不补。
+           套卷壳 taojuan 是派生数据（records 恒空），不能按这个规则处理。 */
+        if(!lv){
+          const cp=JSON.parse(JSON.stringify(rv));
+          const dm=entMaps['brec']||entityDelMap('brec',L,R);
+          if(sec!=='taojuan'){
+            if(!Array.isArray(cp.records))seedRecordsIfLegacy(cp,d+'|'+sec);
+            if(Array.isArray(cp.records))cp.records=cp.records.filter(function(r){
+              const k=recDelKey(r);
+              return !k||!dm.has(k)||!(dm.get(k)>(r.ts||0));
+            });
+            if(Array.isArray(cp.records)&&!cp.records.length)return;
+          }
+          L.dailyStats[d][sec]=cp;
+          if(sec!=='taojuan'&&Array.isArray(cp.records)&&cp.records.length)recomputeDailyStat(sec,d);
+          return;
+        }
         const lvPrev={count:lv.count||0,rate:lv.rate,subs:lv.subs};
         // 本地已有：合并 records（按指纹去重，本地优先保留）
-        if(!Array.isArray(lv.records))seedRecordsIfLegacy(lv);
-        if(!Array.isArray(rv.records))seedRecordsIfLegacy(rv);
+        if(!Array.isArray(lv.records))seedRecordsIfLegacy(lv,d+'|'+sec);
+        if(!Array.isArray(rv.records))seedRecordsIfLegacy(rv,d+'|'+sec);
         const lr=lv.records||[], rr=rv.records||[];
         const fp=function(r){return (r.ts||0)+'|'+(r.sub||'__overall__')+'|'+(r.count||0);};
+        /* 同一条记录的 ts+sub（编辑时不换 ts）：题量被改过会导致指纹不同，
+           若只按指纹去重会把「改前/改后」两份都并进来、题量翻倍。 */
+        const tk=function(r){return (r.ts||0)+'|'+(r.sub||'__overall__');};
         const seen=new Set(lr.map(fp));
-        rr.forEach(function(r){const f=fp(r);if(!seen.has(f)){seen.add(f);lr.push(JSON.parse(JSON.stringify(r)));}});
+        const byTK=new Map(); lr.forEach(function(r){byTK.set(tk(r),r);});
+        rr.forEach(function(r){
+          const f=fp(r);
+          if(seen.has(f))return;
+          const same=byTK.get(tk(r));
+          if(same&&(r.ets||same.ets)){
+            if((r.ets||0)>(same.ets||0))Object.assign(same,r);
+            return;
+          }
+          seen.add(f);lr.push(JSON.parse(JSON.stringify(r)));
+        });
         lv.records=lr;
+        /* 单条刷题记录的删除墓碑：一端删掉的记录不能被另一端并回来。
+           trea 已用 ets 收敛「编辑不翻倍」，删除同样需要标记，否则「改完删掉」两端又对不上。 */
+        const brecDel=entMaps['brec']||entityDelMap('brec',L,R);
+        lv.records=lv.records.filter(function(r){
+          const k=recDelKey(r);
+          return !k||!brecDel.has(k)||!(brecDel.get(k)>(r.ts||0));
+        });
         // minutes 取两端较大值（records 被消费过的端 sum(min) 可能小于真实分钟数）
         const lm=lv.minutes||0, rm=rv.minutes||0;
         if(rm>lm)lv.minutes=rm;
@@ -911,6 +1099,9 @@ function applyRemoteMerge(remote,remoteTs){
       if(!Object.keys(L.dailyStats[d]).length)delete L.dailyStats[d];
     });
   }
+  /* 练习册已删 → 成绩记录上的 bkId/bkN 是悬空标记。放在 dailyStats 合并块外面：
+     远端带来本地没有的日期/模块时是直接整块复制的，也必须扫到。 */
+  stripDeadBookletRefs(L,entMaps.course);
   // —— 套卷复盘 / 申论批改：按 id 并集，同 id 用 mts LWW（编辑过的版本覆盖旧版）——
   function mergeByIdLWW(localArr,remoteArr){
     if(!Array.isArray(localArr))localArr=[];
@@ -934,25 +1125,32 @@ function applyRemoteMerge(remote,remoteTs){
     _tjDates.forEach(function(d){ syncTaojuanDaily(d); });
   }catch(e){}
   if((Array.isArray(R.shenlunReviews)&&R.shenlunReviews.length)||(Array.isArray(L.shenlunReviews)&&L.shenlunReviews.length))L.shenlunReviews=mergeEntities(L.shenlunReviews,R.shenlunReviews,entMaps.shenlunReview,null,function(x){return x.mts||x.createdAt||0;});
-  // —— 课程：元数据按 mts 取较新（改名字/老师/模块/总讲数能同步）；
+  // —— 课程：每个字段各自按时间戳取较新（两端同时改不同字段不会互相覆盖）；
   //    讲数 done 按 n 并集（两端各听的讲都保留），撤销的讲用 lesson 墓碑同步 ——
   function mergeCourse(a,b){
-    const r=Object.assign({},((b.mts||0)>(a.mts||0))?b:a);
+    /* 以前整对象按 mts 取新：一端改名、另一端改总讲数，合并后必丢一项。
+       同一毫秒两端改同一字段时按字段值字典序取，保证两台设备合并结果一致（能收敛）。 */
+    const r=Object.assign({},a),fm={};
+    COURSE_LWW_FIELDS.forEach(function(f){
+      const ta=courseFieldTs(a,f),tb=courseFieldTs(b,f);
+      if(tb>ta){r[f]=b[f];fm[f]=tb;}
+      else if(ta>tb){r[f]=a[f];fm[f]=ta;}
+      else {r[f]=(String(b[f]==null?'':b[f])>String(a[f]==null?'':a[f]))?b[f]:a[f];fm[f]=ta;}
+    });
+    r.fMts=fm;
+    r.mts=Math.max(a.mts||0,b.mts||0);
     const lm=entityDelMap('lesson:'+(a.id!=null?a.id:b.id),L,R);
-    const dm=new Map();
-    [a.done,b.done].forEach(function(arr){
-      (Array.isArray(arr)?arr:[]).forEach(function(d){
-        if(!d||d.n==null)return;
-        const ex=dm.get(d.n);
-        if(!ex||((d.ts||0)>(ex.ts||0)))dm.set(d.n,d);
-      });
-    });
-    r.done=Array.from(dm.values()).filter(function(d){
-      const dt=lm.get(d.n);
-      return !(dt!=null&&dt>(d.ts||0));
-    });
-    if(b.total&&(!r.total||b.total>r.total))r.total=b.total;
-    if(b.note&&(!r.note||b.note.length>r.note.length))r.note=b.note;
+    /* done 与 archivedDone 一起算全集：一端把总讲数改小暂存的讲，另一端同步过来后
+       按最终 total 自动归位（改回来就能恢复），不会因为整对象 LWW 丢掉。
+       同讲号按 ts 取较新；用户主动撤销的讲用 lesson 墓碑过滤。 */
+    r.done=Array.isArray(a.done)?a.done:[];
+    r.archivedDone=[].concat(
+      Array.isArray(a.archivedDone)?a.archivedDone:[],
+      Array.isArray(b.done)?b.done:[],
+      Array.isArray(b.archivedDone)?b.archivedDone:[]
+    );
+    reconcileCourseDone(r,lm);
+    /* note 也走字段级时间戳，不再按「谁更长」挑（那样两端合并结果会不一样） */
     return r;
   }
   if((Array.isArray(R.courses)&&R.courses.length)||(Array.isArray(L.courses)&&L.courses.length)){
@@ -1079,7 +1277,7 @@ function applyRemoteMerge(remote,remoteTs){
   // —— pomoNoPromptDate：取较新的日期 ——
   if(R.pomoNoPromptDate&&R.pomoNoPromptDate>(L.pomoNoPromptDate||''))L.pomoNoPromptDate=R.pomoNoPromptDate;
   // 合并后统一补迁移 + 数组守卫（远端可能是旧结构）
-  migrateTodos();ensureArrayList();
+  migrateTodos();ensureArrayList();normalizeStats();
 }
 function doPull(silent){
   var cfg=getSyncCfg();if(!cfg)return Promise.resolve();
@@ -1100,7 +1298,7 @@ function doPull(silent){
       if(!silent&&hasLocalChanges&&remoteTs>localTs&&localHasRealData()){
         // 真冲突才问；否则走下方自动并集合并
         uiConfirm('检测到云端有更新的数据，同时本地也有未同步的修改。选择「确定」用云端数据覆盖本地（本地未同步的修改将丢失）；选择「取消」保留本地并做智能合并（两边数据都保留）',
-          function(){ delete remote._syncTs;delete remote._photoStripped; state=Object.assign(loadData(),remote); migrateTodos();ensureArrayList(); state._syncTs=remoteTs; cfg.lastPullTs=remoteTs;setSyncCfg(cfg); save(true); render(); setSyncStatus('ok','已同步 '+fmtTime(new Date())); },
+          function(){ delete remote._syncTs;delete remote._photoStripped; state=Object.assign(loadData(),remote); stripDeadBookletRefs(state,entityDelMap('course',state,null)); migrateTodos();ensureArrayList();normalizeStats(); state._syncTs=remoteTs; cfg.lastPullTs=remoteTs;setSyncCfg(cfg); save(true); render(); setSyncStatus('ok','已同步 '+fmtTime(new Date())); },
           {okText:'用云端覆盖', cancelText:'智能合并', onCancel:function(){ applyRemoteMerge(remote,remoteTs); state._syncTs=Date.now(); cfg.lastPullTs=Date.now();setSyncCfg(cfg); save(); render(); setSyncStatus('ok','已合并 '+fmtTime(new Date())); }});
         return;
       }
@@ -1126,18 +1324,29 @@ function scheduleSync(){
   var cfg=getSyncCfg();if(!cfg||cfg.auto===false)return;
   if(bootPullPending)return; // 启动拉取未完成前不放行上传，防覆盖云端
   if(syncTimer){clearTimeout(syncTimer);}
-  syncTimer=setTimeout(function(){syncTimer=null;lastPush=Date.now();doPush();},AUTO_PUSH_DEBOUNCE);
+  syncTimer=setTimeout(function(){
+    syncTimer=null;
+    var c=getSyncCfg();
+    if(!c||c.auto===false)return;   // 关掉自动同步后，之前排队的这次推送也取消
+    lastPush=Date.now();doPush();
+  },AUTO_PUSH_DEBOUNCE);
 }
 function schedulePoll(){
   var cfg=getSyncCfg();if(!cfg||cfg.auto===false)return;
   if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
   // 切回前台立即拉一次，之后每 30 秒轮询（云端无更新不下载正文，几乎零开销）
   if(!document.hidden)doPull(true);
-  pollTimer=setInterval(function(){if(!document.hidden)doPull(true);},AUTO_PULL_INTERVAL);
+  pollTimer=setInterval(function(){
+    // 关掉「自动同步」后别再拉：定时器不会随开关自动取消，这里兜底并顺手停掉
+    var c=getSyncCfg();
+    if(!c||c.auto===false){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}return;}
+    if(!document.hidden)doPull(true);
+  },AUTO_PULL_INTERVAL);
 }
 document.addEventListener('visibilitychange',function(){
   if(!document.hidden){
-    if(getSyncCfg())doPull(true); // 切回前台立即拉
+    var _cfg=getSyncCfg();
+    if(_cfg&&_cfg.auto!==false)doPull(true); // 切回前台立即拉（关了自动同步就不拉）
     if(pomo.running&&_pomoUpdate)_pomoUpdate(); // 切回前台立即刷新番茄钟显示（后台用时间戳续跑，数字即刻正确）
   }else{
     flushSyncIfDirty(); // 切到后台/最小化：趁页面还活着，先把未推送改动传上去
@@ -1186,6 +1395,10 @@ function syncConnect(){
 }
 function syncDisconnect(){
   uiConfirm('断开云端同步？本地数据保留，之后不再自动同步。',()=>{
+    if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+    if(syncTimer){clearTimeout(syncTimer);syncTimer=null;}
+    if(dailySyncTimer){clearTimeout(dailySyncTimer);dailySyncTimer=null;}
+    if(dailySyncInterval){clearInterval(dailySyncInterval);dailySyncInterval=null;}
     setSyncCfg(null);syncState={s:'idle',msg:'未配置'};if(currentTab==='mine')render();
   },{danger:true});
 }
@@ -1408,7 +1621,10 @@ function daySectionMin(dateStr){
 // 统一判定：某天某模块是否完成打卡（录入题量 或 历史打卡标记任一为真）
 function isChecked(dateStr,k){
   const ds=(state.dailyStats[dateStr]||{})[k];
-  return !!(ds&&(ds.count||0)>0);
+  if(ds&&(ds.count||0)>0)return true;
+  /* 申论「录得分」只写 shenlunReviews，也应点亮当天月历 */
+  if(k==='shenlun')return (state.shenlunReviews||[]).some(r=>r&&r.date===dateStr);
+  return false;
 }
 
 /* ---------- 导航 ---------- */
@@ -1423,6 +1639,9 @@ const TAB_TITLES={
 const MODULE_TABS=['politics','changshi','yanyu','luoji','shuliang','ziliao','xiaoti','dazuowen'];
 let currentTab='countdown';
 let reviewMainTab='overview';
+/* 练习册连标多章时，待问成绩的章号队列：一次弹一个，关掉弹窗再问下一章，
+   避免「后一次覆盖了前一次」导致只有最后一章能录成绩 */
+var _brushAskQueue=[];
 
 /* 模块 key → 侧边栏 tab key（两者不完全同名，必须映射） */
 const SECTION_TO_TAB={
@@ -1665,6 +1884,13 @@ function render(){
   updateSidebarProfile();
   updateTopbar(currentTab);
   const content=$('#content');
+  /* 课程页 / 数据页安全网：弹窗保存、云同步回来触发的重渲染也别弹回顶部。
+     切 tab 时 goTab 会在 render 之后另外强制置顶，所以这里只管「还停在本页」的情况。 */
+  const _autoKeep=((currentTab==='course'||currentTab==='review')&&!_preserveView)
+    ?{scrollTop:content.scrollTop||0,scrollY:window.scrollY||0,
+      expanded:[...new Set([...document.querySelectorAll('#content .weak-sub')].filter(s=>s.style.display!=='none').map(s=>s.dataset.parent))]}:null;
+  const _view=_preserveView||_autoKeep;
+  _autoExpanded=(_view&&_view.expanded&&_view.expanded.length)?_view.expanded:[];
   if(!_freshDone)content.classList.add('fresh');   // 首屏：让卡片播放入场动画
   // 关键：先把空面板挂到文档，再调用各 tab 的渲染函数填充。
   // 否则渲染函数内 document.querySelector('#id') 找不到自己刚创建的子元素（脱离文档的临时节点），
@@ -1689,12 +1915,12 @@ function render(){
   }
   // 只在非实时 tab 上缓存：NO_CACHE_TABS 每次访问都重建，缓存它只会让旧 DOM 滞留内存
   if(!NO_CACHE_TABS[currentTab])_tabPanes[currentTab]=pane;
-  scrollTopInstant(content,_preserveView?(_preserveView.scrollTop||0):0);
+  scrollTopInstant(content,_view?(_view.scrollTop||0):0);
   if(!_freshDone){
     _freshDone=true;
     setTimeout(()=>{content.classList.remove('fresh');},450); // 动画播完再移除，避免跳变
   }
-  try{window.scrollTo(0,_preserveView?(_preserveView.scrollY||0):0);}catch(e){}
+  try{window.scrollTo(0,_view?(_view.scrollY||0):0);}catch(e){}
   updateTabbar();
 }
 
@@ -1957,11 +2183,20 @@ function syncTimetableTodos(silent){
     const learned=(course.done?course.done.length:0);
     /* 总讲数已听完 → 不再生成「下一讲」 */
     if(course.total&&learned>=course.total){state.ttTodoLog[k]=Date.now();return;}
-    /* 今天已有同课程的待办（手动加的也算，含已完成）→ 不重复生成，记日志防反复检查 */
-    const dup=(state.todos||[]).some(td=>td&&td.courseId===course.id&&td.dueDate===t);
+    /* 今天已有「这一节课表条目」的自动待办 → 不重复生成，记日志防反复检查。
+       键用课表条目 id（autoTt），同一门课一天排两节时各生成一条，不能按 courseId 去重 */
+    const dup=(state.todos||[]).some(td=>td&&td.autoTt===c.id&&td.dueDate===t);
     state.ttTodoLog[k]=Date.now();
     if(dup)return;
-    const next=nextLessonNum(course);
+    /* 同一门课今天可能已挂着第1讲待办（另一节/手动加）：跳过已占用的讲号，避免两条都是第1讲 */
+    let next=nextLessonNum(course);
+    const usedNums=new Set();
+    (state.todos||[]).forEach(function(td){
+      if(!td||td.done||td.courseId!==course.id||td.dueDate!==t)return;
+      const m=String(td.text||'').match(/第\s*(\d+)\s*[讲章]/);
+      if(m)usedNums.add(parseInt(m[1],10));
+    });
+    while(usedNums.has(next))next++;
     (state.todos=state.todos||[]).push({
       id:'tt_'+c.id+'_'+t,
       text:c.name+' 第'+next+(course.type==='brush'?'章':'讲'),
@@ -1980,10 +2215,10 @@ function syncTimetableTodos(silent){
 }
 /* 格内/当天课程按创建先后排序（同一门课一天可加多节，按添加顺序排） */
 function ttSort(list){return (list||[]).slice().sort((a,b)=>(a.createdAt||0)-(b.createdAt||0));}
-/* 当前查看的是第几周（相对本周）：0=本周 -1=上周 1=下周，其他返回 null */
+/* 当前查看的是第几周（相对本周）：0=本周 -1=上周 1=下周；再远也返回真实周差，标题才不会写成「本周」 */
 function ttWeekOffset(ws){
   const w=Math.round((ws.getTime()-ttWeekStart(new Date()).getTime())/604800000);
-  return (w>=-2&&w<=2&&w!==0)?w:(w===0?0:null);
+  return w;
 }
 function renderTimetableCard(pane){
   const card=el('div','card tt-card');
@@ -1991,7 +2226,7 @@ function renderTimetableCard(pane){
   const wsStr=ttDateStr(ws),weStr=ttDateStr(we);
   const todayD=todayStr();
   const woff=ttWeekOffset(ws);
-  const weekTitle=(woff===0?'本周':(woff===-1?'上周':(woff===1?'下周':'本周')))+'课表';
+  const weekTitle=(woff===0?'本周':(woff===-1?'上周':(woff===1?'下周':(woff>0?(woff+' 周后'):(-woff+' 周前')))))+'课表';
   // 本周课程总节数（每周固定 + 本周内一次性课）
   let weekCount=0;
   for(let i=0;i<7;i++){const d=new Date(ws);d.setDate(d.getDate()+i);weekCount+=ttDayCourses(ttDateStr(d)).length;}
@@ -2073,8 +2308,9 @@ function ttRefreshAfterEdit(){
   const pane=card?card.parentElement:(document.querySelector('.tab-pane')||null);
   if(pane)ttRerender(pane);
 }
-function openTimetableMonth(){
-  const calCursor=new Date();
+function openTimetableMonth(baseDate){
+  /* baseDate 传了日期就从那天所在月开始（从某天详情返回时保持原月份），否则从本月开始 */
+  const calCursor=baseDate?new Date(baseDate+'T00:00:00'):new Date();
   openModal('月历安排课程','<div id="ttCalBody"></div>');
   const body=document.getElementById('ttCalBody');
   function update(){
@@ -2135,7 +2371,7 @@ function openTimetableDay(weekday,ds){
       body.appendChild(row);
     });
   }
-  document.getElementById('ttDayClose').addEventListener('click',()=>{closeModal();openTimetableMonth();});
+  document.getElementById('ttDayClose').addEventListener('click',()=>{closeModal();openTimetableMonth(ds);});
   document.getElementById('ttDayAdd').addEventListener('click',()=>{closeModal();openTimetableEdit(weekday,ds,null,true);});
 }
 function openTimetableEdit(weekday,dateStr,id,keepDay){
@@ -2272,10 +2508,19 @@ function migrateCourseDone(){
     if(!c)return;
     if(!Array.isArray(c.done)){if(c.done!==undefined){c.done=[];changed=true;}return;}
     const before=JSON.stringify(c.done);
-    if(c.done.length && c.done.every(function(d){return d&&typeof d.n!=='number';})){
-      c.done=c.done.map(function(d,i){return {n:i+1,ts:d.ts||Date.now(),date:d.date||todayStr()};});
-    }
-    c.done.forEach(function(d,i){ if(d&&typeof d.n!=='number')d.n=i+1; });
+    /* 统一成 {n,ts,date}。兼容历史里的三种形态：纯数字、{id,ts,date}（无 n）、混合数组。
+       注意 'use strict' 下给数字原始值赋 d.n 会抛 TypeError，必须重建对象。
+       没有编号的老对象按「最小可用讲号」补，避免与显式讲号相撞后被去重丢掉。 */
+    const _used={};
+    c.done=c.done.map(function(d){
+      let n;
+      if(typeof d==='number')n=d;
+      else if(d&&typeof d.n==='number')n=d.n;
+      else if(d&&d.n!=null&&isFinite(+d.n))n=+d.n;  // 老存档讲号可能是字符串 '5'，别当成「没编号」补成第1讲
+      else {n=1;while(_used[n])n++;}
+      _used[n]=1;
+      return {n:n,ts:(d&&d.ts)||Date.now(),date:(d&&d.date)||todayStr()};
+    });
     const seen={}; c.done=c.done.filter(function(d){ if(!d||seen[d.n])return false; seen[d.n]=1; return true; });
     if(JSON.stringify(c.done)!==before)changed=true;
   });
@@ -2316,12 +2561,13 @@ function toggleLesson(id,n,cellEl){
   }
   const tt=+c.total||0, done=c.done.length;
   const pct=tt?Math.min(100,Math.round(done/tt*100)):(done?100:0);
+  const _isBk=c.type==='brush', _unit=_isBk?'章':'讲', _doneWord=_isBk?'已刷':'已听';
   if(item){
     const bar=item.querySelector('.course-bar i'); if(bar)bar.style.width=pct+'%';
-    const meta=item.querySelector('.course-meta'); if(meta)meta.innerHTML='<span>已听 <b>'+done+'</b>'+(tt?(' / '+tt):'')+' 讲'+(tt?('（'+pct+'%）'):'')+'</span>';
+    const meta=item.querySelector('.course-meta'); if(meta)meta.innerHTML='<span>'+_doneWord+' <b>'+done+'</b>'+(tt?(' / '+tt):'')+' '+_unit+(tt?('（'+pct+'%）'):'')+'</span>';
     item.classList.toggle('course-done', tt>0&&done>=tt);
     let tag=item.querySelector('.course-finish-tag');
-    if(tt>0&&done>=tt){ if(!tag){const nm=item.querySelector('.course-name'); const t=document.createElement('span');t.className='course-finish-tag';t.textContent='已结课';nm.appendChild(t);} }
+    if(tt>0&&done>=tt){ if(!tag){const nm=item.querySelector('.course-name'); const t=document.createElement('span');t.className='course-finish-tag';t.textContent=_isBk?'已刷完':'已结课';nm.appendChild(t);} }
     else if(tag){tag.remove();}
     const undoBtn=item.querySelector('.course-undo'); if(undoBtn)undoBtn.style.display=done?'':'none';
     const lc=item.querySelector('.lesson-count'); if(lc)lc.textContent=(c.done?c.done.length:0)+'/'+(+c.total||0);
@@ -2342,18 +2588,19 @@ function openLessonsModal(c){
   box.querySelectorAll('.les-cell').forEach(function(cell){
     cell.addEventListener('click',function(){
       const n=parseInt(cell.dataset.n,10);
-      const wasOn=set.has(n);
       toggleLesson(c.id,n,null);
-      const cnt=(findCourse(c.id).done||[]).length;
+      const cur=findCourse(c.id);
+      const cnt=(cur.done||[]).length;
       const cc=box.querySelector('#lesModalCount'); if(cc)cc.textContent=doneWord+' '+cnt+'/'+tt;
-      cell.classList.toggle('on',!wasOn);
+      // 每次点击后按最新 done 重新判定：不能在打开弹窗时缓存 set，连点同一格会导致 UI 与数据相反
+      cell.classList.toggle('on',courseDoneSet(cur).has(n));
       refreshCourseCardDOM(c.id);
     });
   });
   const undoBtn=box.querySelector('#lesModalUndo');
   if(undoBtn)undoBtn.addEventListener('click',function(){
     const cur=findCourse(c.id); if(!cur||!(cur.done||[]).length){toast('没有可撤销的'+unit+'次');return;}
-    const last=cur.done.reduce(function(a,x){return (x.n>a.n?x:a);},{n:0});
+    const last=lastDoneLesson(cur);
     toggleLesson(cur.id,last.n,null);
     const cnt=(findCourse(c.id).done||[]).length;
     const cc=box.querySelector('#lesModalCount'); if(cc)cc.textContent=doneWord+' '+cnt+'/'+tt;
@@ -2378,7 +2625,12 @@ function refreshCourseCardDOM(cid){
   const nb=item.querySelector('.course-next');
   if(nb){
     if(tt>0&&done>=tt){nb.disabled=true;nb.textContent=(isBk?'已刷完 ':'已听完 ')+tt+' '+unit+' ✓';nb.style.opacity='.5';nb.style.cursor='default';}
-    else {nb.disabled=false;nb.style.opacity='';nb.style.cursor='';}
+    else {
+      nb.disabled=false;nb.style.opacity='';nb.style.cursor='';
+      // 满讲时渲染的是没有 data-act 的禁用按钮：撤销一讲后必须把动作和文案恢复，否则永远点不动
+      nb.dataset.act='next';
+      nb.textContent=isBk?'刷完下一章 ✓':'听完下一讲 ✓';
+    }
   }
 }
 /* 同步「第 n 讲」待办为完成 */
@@ -2386,9 +2638,13 @@ function syncTodoForLesson(c,n){
   if(!Array.isArray(state.todos))return;
   const matched=state.todos.find(td=>{
     if(!td||td.done||td.jumpType!=='course')return false;
-    if(td.courseId)return td.courseId===c.id;
     const txt=td.text||'';
-    return txt.includes(c.name)&&new RegExp('第\\s*'+n+'\\s*[讲章]').test(txt);
+    const sameCourse=td.courseId?(td.courseId===c.id):txt.includes(c.name);
+    if(!sameCourse)return false;
+    // 同一课程可能同时挂着「第1讲」「第2讲」多条待办：文本带讲号时必须按讲号匹配，
+    // 否则标第 2 讲会把第 1 讲的待办勾掉
+    const m=txt.match(/第\s*(\d+)\s*[讲章]/);
+    return m?parseInt(m[1],10)===n:true;
   });
   if(matched){
     completeTodoOnce(matched,{advanceDueDate:false});
@@ -2397,7 +2653,11 @@ function syncTodoForLesson(c,n){
   }
 }
 /* 听完一讲：仅用于「未设总讲数」的课程（无格子可点时的兜底 +1） */
+let _courseFinishLock=0;   // 连点防抖：手机双击时第二下会落在重渲染后的新按钮上，会一次记两讲
 function finishLesson(id){
+  const now=Date.now();
+  if(now-_courseFinishLock<600)return;
+  _courseFinishLock=now;
   const c=findCourse(id); if(!c)return;
   const d=todayStr();
   if(!Array.isArray(c.done))c.done=[];
@@ -2413,7 +2673,7 @@ function finishLesson(id){
   if(tt&&c.done.length>=tt){
     if(dropTodos(td=>td&&!td.done&&td.jumpType==='course'&&td.autoTt&&td.courseId===c.id)){save();setTimeout(()=>toast(c.type==='brush'?'练习册已刷完，自动练习待办已清理':'课程已结课，自动听课待办已清理'),1200);}
   }
-  render();
+  renderKeepScroll();
   if(c.type==='brush')promptBrushIfNeeded(c);
 }
 /* 练习册听完一讲后，统一弹出「本次有刷题？」选择录入成绩或跳过。
@@ -2421,15 +2681,46 @@ function finishLesson(id){
 function promptBrushIfNeeded(c){
   if(!c||c.type!=='brush')return;
   if(c.section&&SECTION_MAP[c.section]){
-    setTimeout(()=>askBrushRecord(c),300);
+    const _last=lastDoneLesson(c);
+    const bkN=_last?numOr(_last.n,1):1;
+    /* 连标多章不能只留最后一次询问：把章号排进队列，关掉格子弹窗后逐章问。
+       每次关弹窗问下一章；章被撤销就跳过；成绩录入弹窗开着时不抢，等它关掉再问。 */
+    if(!_brushAskQueue.some(function(q){return q.id===c.id&&q.n===bkN;}))_brushAskQueue.push({id:c.id,n:bkN});
+    setTimeout(function(){
+      if(!courseDoneSet(c).has(bkN)){
+        _brushAskQueue=_brushAskQueue.filter(function(q){return !(q.id===c.id&&q.n===bkN);});
+        return;   // 这一章随后被撤销了，就别再问成绩
+      }
+      scheduleBrushAsk();
+    },300);
   }else{
     toast('「'+c.name+'」是练习册，但没关联模块，去编辑里选好模块就能录成绩');
   }
 }
+/* 关掉任意弹窗后，从队列里挑下一章问成绩；当前有弹窗开着就先不动，等下次关弹窗 */
+function scheduleBrushAsk(){
+  if(!_brushAskQueue.length)return;
+  setTimeout(function(){
+    if(!_brushAskQueue.length)return;
+    const m=$('#modal');
+    if(m&&m.classList.contains('show'))return;
+    drainBrushAskQueue();
+  },0);
+}
+function drainBrushAskQueue(){
+  while(_brushAskQueue.length){
+    const q=_brushAskQueue.shift();
+    const c=findCourse(q.id);
+    if(!c||c.type!=='brush'||!c.section||!SECTION_MAP[c.section])continue;
+    if(!courseDoneSet(c).has(q.n))continue;
+    askBrushRecord(c,q.n);
+    return;
+  }
+}
 /* 练习册听完一讲后：弹出「本次有刷题？」选择录入成绩或跳过 */
-function askBrushRecord(c){
-  const _last=(c.done&&c.done.length)?c.done[c.done.length-1]:null;
-  const bkN=_last?(typeof _last==='object'?(_last.n||c.done.length):(+_last||1)):1;
+function askBrushRecord(c,forceN){
+  const _last=lastDoneLesson(c);
+  const bkN=forceN||(_last?numOr(_last.n,1):1);
   openModal('本次有刷题吗？',
     `<p style="margin:0 0 14px;color:var(--text-sub);font-size:13px;line-height:1.6;">「${escapeHtml(c.name)}」第 ${bkN} 章刷完了，要不要记录本次刷题成绩？录了会并进「${SECTION_MAP[c.section].name}」的正确率统计，也会记到这本练习册里。</p>
      <div class="dlg-actions"><button class="btn btn-ghost" id="lesSkip">跳过</button><button class="btn" id="lesRecord">录入成绩</button></div>`);
@@ -2466,14 +2757,20 @@ function syncCourseProgressByTodo(td){
   if(added>0)promptBrushIfNeeded(c);
   return added;
 }
-/* 撤销上一讲：移除最近完成的一讲（按时间最新的那讲，而非数组末尾） */
+/* 最近完成的一讲（按 ts 最新，而不是讲号最大/数组末尾）：卡片撤销与讲义弹窗撤销共用，口径必须一致 */
+function lastDoneLesson(c){
+  if(!c||!Array.isArray(c.done)||!c.done.length)return null;
+  let idx=0,max=-1;
+  c.done.forEach(function(d,i){ if((d&&d.ts||0)>max){max=(d&&d.ts)||0;idx=i;} });
+  return c.done[idx];
+}
+/* 撤销上一讲：移除最近完成的一讲 */
 function undoLesson(id){
   const c=findCourse(id); if(!c||!Array.isArray(c.done)||!c.done.length)return;
-  let idx=0,max=-1;
-  c.done.forEach(function(d,i){ if((d.ts||0)>max){max=d.ts||0;idx=i;} });
-  const removed=c.done[idx];
+  const removed=lastDoneLesson(c);
+  const idx=c.done.indexOf(removed);
   c.done.splice(idx,1);markEntityDeleted('lesson:'+id,[removed&&removed.n]);c.mts=Date.now();
-  save();toast('已撤销「'+c.name+'」第 '+((removed&&removed.n)?removed.n:(c.done.length+1))+(c.type==='brush'?' 章':' 讲'));render();
+  save();toast('已撤销「'+c.name+'」第 '+((removed&&removed.n)?removed.n:(c.done.length+1))+(c.type==='brush'?' 章':' 讲'));renderKeepScroll();
 }
 /* 添加 / 编辑课程 */
 /* 练习册卡片「+ 加入今日任务」：一点直接加进今日任务，不弹窗、不打字。
@@ -2481,7 +2778,9 @@ function undoLesson(id){
    勾选后仍会自动补「刷完一章」并可录成绩。 */
 function bookletTodoOf(c){
   return (Array.isArray(state.todos)?state.todos:[]).find(function(td){
-    return td&&!td.done&&!td.autoTt&&td.courseId===c.id&&td.jumpType==='course';
+    /* 不再排除课表自动生成的 autoTt：同课程只要今天还有未完成待办就视为「已加入」，
+       否则手动点 + 会和课表自动待办重复排两份 */
+    return td&&!td.done&&td.courseId===c.id&&td.jumpType==='course';
   });
 }
 function addBookletTodo(c){
@@ -2492,7 +2791,7 @@ function addBookletTodo(c){
   if(!Array.isArray(state.todos))state.todos=[];
   state.todos.push({id:uid(),text:c.name+' 第'+n+'章',dueDate:todayStr(),section:c.section||'',sub:'',count:0,
     repeat:{type:'none'},jumpType:'course',courseId:c.id,done:false,ts:now,mts:now});
-  save();render();toast('已加入今日任务：'+c.name+' 第'+n+'章');
+  save();renderKeepScroll();toast('已加入今日任务：'+c.name+' 第'+n+'章');
 }
 /* 添加 / 编辑课程（prefill 可预填类型等默认值） */
 
@@ -2500,9 +2799,16 @@ function courseFormModal(id,prefill){
   const c=id?findCourse(id):null;
   const v=c||Object.assign({name:'',teacher:'',section:'',total:''},prefill||{});
   const isBk=v.type==='brush';
-  const secOpts=['<option value="">不关联</option>'].concat(SECTIONS.map(function(s){
-    return '<option value="'+s.key+'"'+(v.section===s.key?' selected':'')+'>'+escapeHtml(s.name)+'</option>';
-  })).join('');
+  /* 练习册不提供「行测套卷」：套卷成绩是另一套账（examRecords），挂不到练习册的整本汇总上，选了也看不到。
+     老数据里已经关联套卷的练习册例外保留这一项，方便进来改掉，不至于凭空变成「不关联」。 */
+  const _isOldTtBk=!!(c&&c.type==='brush'&&c.section==='taojuan');
+  const secOpts=function(brush){
+    return ['<option value="">不关联</option>'].concat(SECTIONS.filter(function(s){
+      return !(brush&&s.key==='taojuan'&&!_isOldTtBk);
+    }).map(function(s){
+      return '<option value="'+s.key+'"'+(v.section===s.key?' selected':'')+'>'+escapeHtml(s.name)+'</option>';
+    })).join('');
+  };
   openModal(c?(isBk?'编辑练习册':'编辑课程'):(isBk?'添加练习册':'添加课程'),
     `<div class="dlg-form">
       <label class="dlg-label">${isBk?'练习册名':'课程名'}</label>
@@ -2510,7 +2816,7 @@ function courseFormModal(id,prefill){
       <label class="dlg-label">${isBk?'备注（选填）':'老师（选填）'}</label>
       <input class="dlg-input" id="cfTeacher" value="${escDlg(v.teacher||'')}" placeholder="${isBk?'如：2026 版':'如：郭熙'}">
       <label class="dlg-label">关联模块（选填，只作标记）</label>
-      <select class="dlg-input" id="cfSec">${secOpts}</select>
+      <select class="dlg-input" id="cfSec">${secOpts(isBk)}</select>
       <label class="dlg-label">类型</label>
       <select class="dlg-input" id="cfType">
         <option value="listen"${!isBk?' selected':''}>听课</option>
@@ -2523,6 +2829,14 @@ function courseFormModal(id,prefill){
       <div class="dlg-actions"><button class="btn btn-ghost dlg-cancel">取消</button><button class="btn dlg-ok">${c?'保存':'添加'}</button></div>
     </div>`);
   const box=$('#modalBody'); if(!box)return;
+  const _secSel=box.querySelector('#cfSec'), _typeSel=box.querySelector('#cfType');
+  // 切换类型时重建模块选项：听课可选套卷，练习册隐藏套卷（当前选中的套卷会被清成「不关联」）
+  _typeSel.addEventListener('change',function(){
+    const keep=_secSel.value;
+    _secSel.innerHTML=secOpts(_typeSel.value==='brush');
+    _secSel.value=keep;
+    if(_secSel.value!==keep)_secSel.value='';
+  });
   box.querySelector('#cfSec').value=v.section||'';
   box.querySelector('.dlg-cancel').onclick=closeModal;
   box.querySelector('.dlg-ok').onclick=function(){
@@ -2531,31 +2845,59 @@ function courseFormModal(id,prefill){
     const teacher=(box.querySelector('#cfTeacher').value||'').trim();
     const section=box.querySelector('#cfSec').value||'';
     const type=box.querySelector('#cfType').value==='brush'?'brush':'listen';
+    if(type==='brush'&&section==='taojuan'&&!_isOldTtBk){
+      const e=box.querySelector('.dlg-err');if(e)e.textContent='练习册不能关联「行测套卷」：套卷成绩在套卷分析里看，请换一个模块';
+      return;
+    }
     const total=Math.max(0,parseInt(box.querySelector('#cfTotal').value||'0',10)||0);
     if(!Array.isArray(state.courses))state.courses=[];
     if(c){
-      c.name=name;c.teacher=teacher;c.section=section;c.type=type;c.total=total;c.mts=Date.now();
-      // 总讲数改小：裁掉超范围的听讲记录（否则讲义弹窗只渲 1..total，超范围记录变无法取消的幽灵数据），并写墓碑同步到对端
-      if(total>0 && Array.isArray(c.done) && c.done.some(d=>d&&d.n>total)){
-        const dropped=c.done.filter(d=>d&&d.n>total).map(d=>d.n);
-        c.done=c.done.filter(d=>d&&d.n<=total);
-        if(dropped.length)markEntityDeleted('lesson:'+c.id, dropped);
-      }
+      const _now=Date.now();
+      /* 字段级时间戳：只给这次真改了的字段打时间，没动的字段保留旧时间。
+         老数据没有 fMts：先把所有字段初始化成「最后一次编辑时间」，再覆盖本次变化项。 */
+      const _fm=(c.fMts&&typeof c.fMts==='object')?Object.assign({},c.fMts):(function(){
+        const o={},base=c.mts||c.createdAt||_now;
+        COURSE_LWW_FIELDS.forEach(function(f){o[f]=base;});
+        return o;
+      })();
+      const _nv={name:name,teacher:teacher,section:section,type:type,total:total};
+      COURSE_LWW_FIELDS.forEach(function(f){
+        if(_nv[f]===undefined)return;
+        if(String(c[f]==null?'':c[f])!==String(_nv[f]))_fm[f]=_now;
+      });
+      c.name=name;c.teacher=teacher;c.section=section;c.type=type;c.total=total;
+      c.fMts=_fm;c.mts=_now;
+      /* 总讲数改小不再物理删记录：移进 archivedDone 暂存，改大时自动恢复，
+         避免手滑填错总章数后进度永久丢失。墓碑只有用户主动「撤销一讲」才写。 */
+      reconcileCourseDone(c,null);
     }
-    else state.courses.push({id:uid(),name:name,teacher:teacher,section:section,type:type,total:total,createdAt:Date.now(),mts:Date.now(),done:[]});
-    save();closeModal();toast(c?'已保存':(type==='brush'?'已添加练习册':'已添加课程'));render();
+    else{
+      const _now=Date.now(),_fm={};
+      COURSE_LWW_FIELDS.forEach(function(f){_fm[f]=_now;});
+      state.courses.push({id:uid(),name:name,teacher:teacher,section:section,type:type,total:total,createdAt:_now,mts:_now,fMts:_fm,done:[]});
+    }
+    const _archN=(c&&Array.isArray(c.archivedDone))?c.archivedDone.length:0;
+    save();closeModal();toast(c?('已保存'+(_archN?('，'+_archN+' 讲暂存；总讲数改回会自动恢复'):'')):(type==='brush'?'已添加练习册':'已添加课程'));renderKeepScroll();
   };
+}
+/* 删除练习册后，历史成绩里的 bkId 会悬空（整本汇总看不到、也没有清理入口）。
+   这里只清关联标记，题量/正确率/时长仍保留在模块统计里，不丢真实成绩。
+   写 ets（= 删除时间）是关键：不然另一端同 ts 的旧记录合并时可能把 bkId 顶回来。 */
+function detachBookletRecords(bkId){
+  const dm=new Map();dm.set(bkId,Date.now());
+  return stripDeadBookletRefs(state,dm);
 }
 function deleteCourse(id){
   const c=findCourse(id); if(!c)return;
-  const related=(state.todos||[]).filter(td=>td&&td.courseId===id).length;
+  const related=(state.todos||[]).filter(td=>td&&td.courseId===id&&!td.done).length;
   const ttRelated=(state.timetable||[]).filter(x=>x&&x.courseId===id).length;
   uiConfirm('删除课程「'+c.name+'」？'+(related?('同时会清理 '+related+' 条关联待办。'):'')+(ttRelated?('课表里 '+ttRelated+' 条安排会保留，但不再自动生成听课待办。'):''),function(){
     state.courses=(state.courses||[]).filter(function(x){return x.id!==id;});markEntityDeleted('course',[id]);
-    if(related){dropTodos(td=>td&&td.courseId===id);}
+    if(related){dropTodos(td=>td&&td.courseId===id&&!td.done);}   // 只清理未完成待办，保留「今天已完成」历史
     /* 课表条目保留（名字还在、课节照上），只解除关联，避免课程已删还自动生成假「第N讲」待办 */
     if(ttRelated){state.timetable.forEach(function(x){if(x&&x.courseId===id)delete x.courseId;});}
-    save();toast('已删除');render();
+    if(c.type==='brush')detachBookletRecords(id);   // 清掉成绩里悬空的 bkId，成绩本身保留在模块统计
+    save();toast('已删除');renderKeepScroll();
   },{danger:true,okText:'删除'});
 }
 /* 练习册整本成绩汇总：从 dailyStats 全部日期、全部模块里挑出带 bkId 的记录。
@@ -2605,9 +2947,9 @@ function renderCourses(pane){
   const list=(Array.isArray(state.courses)?state.courses:[]).filter(function(c){return c&&c.id;});
   const card=el('div','card');
   const totalDone=list.reduce(function(a,c){return a+((c.done||[]).length);},0);
-  const totalTarget=list.reduce(function(a,c){return a+((c.total||0));},0);
+  const totalTarget=list.reduce(function(a,c){return a+numOr(c.total,0);},0);
   card.innerHTML=`<div class="section-title"><span class="dot"></span>我的课程${list.length?`<span class="slr-count">${list.length} 门</span>`:''}
-      ${hmark('网课按「讲」记进度，练习册按「章」记进度；点「讲义 / 章节」弹出全部格子可跳着标。练习册和课程一样手动添加；加好后卡片上点「+ 加入今日任务」一键排进今天，不用手打名称；刷完一章可选录成绩；整本累计题量、正确率、用时显示在卡片上，点汇总行能看每章明细。只记进度不记时间——真实学习时长用番茄钟更有意义。')}</div>
+      ${hmark('网课按「讲」记进度，练习册按「章」记进度；点「讲义 / 章节」弹出全部格子可跳着标。练习册和课程一样手动添加；加好后点卡片右上角的「+」一键排进今天，不用手打名称；刷完一章可选录成绩；整本累计题量、正确率、用时显示在卡片上，点汇总行能看每章明细。只记进度不记时间——真实学习时长用番茄钟更有意义。')}</div>
     <div class="course-tip">${list.length?('已听完 '+totalDone+' 讲'+(totalTarget>0?(' · 目标共 '+totalTarget+' 讲'):'')):''}</div>
     <div class="course-add"><button class="btn" id="courseAddBtn">+ 添加课程</button><button class="btn btn-primary" id="bookletAddBtn">+ 添加练习册</button></div>
     <div id="courseList"></div>`;
@@ -2633,10 +2975,8 @@ function renderCourses(pane){
     item.dataset.cid=c.id;
     // 练习册按「章」、网课按「讲」显示；大额按钮按顺序标下一章/讲，小按钮弹全部格子
     const isBk=c.type==='brush', unit=isBk?'章':'讲', doneWord=isBk?'已刷':'已听';
-    const addtodoBtn=isBk?'':'<button type="button" class="icon-btn" data-act="addtodo" aria-label="加入待办" title="加入待办">'+icon('plus')+'</button>';
-    const hasBkTodo=isBk?!!bookletTodoOf(c):false;
-    const bkTodoBtn=isBk?('<div class="course-bk-add"><button type="button" class="btn'+(hasBkTodo?' btn-ghost':'')+'" data-act="addtodo"'+(full?' disabled style="opacity:.5;cursor:default;"':'')+'>'
-      +(full?'已刷完，无需加任务':(hasBkTodo?'已在今日任务 ✓':'+ 加入今日任务'))+'</button></div>'):'';
+    // 网课和练习册一样，都在卡片右上角用「+」一键加入今日任务（练习册直接加、网课弹编辑框）
+    const addtodoBtn='<button type="button" class="icon-btn" data-act="addtodo" aria-label="加入待办" title="加入待办">'+icon('plus')+'</button>';
     let bkStatHtml='';
     if(isBk){
       const bkSt=brushStatsOf(c.id);
@@ -2680,7 +3020,7 @@ function renderCourses(pane){
       <div class="course-bar"><i style="width:${pct}%"></i></div>
       <div class="course-meta"><span>${doneWord} <b>${done}</b>${tt?(' / '+tt):''} ${unit}${tt?('（'+pct+'%）'):''}</span></div>
       ${bkStatHtml}
-      ${btnsHtml}${bkTodoBtn}`;
+      ${btnsHtml}`;
     item.addEventListener('click',function(e){
       const b=e.target.closest?e.target.closest('[data-act]'):null; if(!b)return;
       const act=b.dataset.act;
@@ -2866,7 +3206,7 @@ function renderHomeCheckin(){
       </div>
       <div class="tc-stats">
         <div class="tc-stat"><span class="tc-stat-k">${unitLabel}</span><span class="tc-stat-v"><b>${count||0}</b> ${unit}</span></div>
-        <div class="tc-stat"><span class="tc-stat-k">${needRate?'正确率':'今日'}</span><span class="tc-stat-v">${needRate?(done?Math.round(stat.rate)+'%':'—'):(done?'已记':'—')}</span></div>
+        <div class="tc-stat"><span class="tc-stat-k">${needRate?'正确率':'今日'}</span><span class="tc-stat-v">${needRate?(done?(stat.rate!=null?Math.round(stat.rate)+'%':'—'):'—'):(done?'已记':'—')}</span></div>
         <div class="tc-stat"><span class="tc-stat-k">时长</span><span class="tc-stat-v">${dur>0?('<b>'+dur+'</b> 分'):'—'}</span></div>
       </div>
       ${lessonCount>0?`<div class="tc-lesson">网课：已听 <b>${lessonCount}</b> 讲</div>`:''}
@@ -3833,10 +4173,10 @@ function openDayDetail(ds){
   if(slReviews.length){
     body+=`<div class="section-title" style="margin-top:14px;font-size:14px;">申论记录（${slReviews.length} 条）</div>`;
     slReviews.forEach(r=>{
-      body+=`<div class="detail-row"><span class="grow">${escapeHtml(r.label||'申论')}${r.type?' · '+escapeHtml(r.type):''}</span><span>${r.score?escapeHtml(r.score):''}</span></div>`;
+      body+=`<div class="detail-row"><span class="grow">${escapeHtml(r.label||'申论')}${r.type?' · '+escapeHtml(r.type):''}</span><span>${r.score?escapeHtml(String(r.score)):''}</span></div>`;
     });
   }
-  const rec=state.studyRecords[ds];
+  const rec=(state.studyRecords||{})[ds];
   if(rec&&(rec.sessions||[]).length){
     body+=`<div class="section-title" style="margin-top:14px;font-size:14px;">番茄钟记录（${rec.sessions.length} 段）</div>`;
     body+=(rec.sessions||[]).map(s=>{
@@ -4745,26 +5085,37 @@ function recomputeDailyStat(sec,d){
   const rec=state.dailyStats[d]&&state.dailyStats[d][sec];
   if(!rec)return;
   const recs=rec.records||[];
-  let sc=0,sw=0,has=false;
-  recs.forEach(r=>{const c=r.count||0;if(c>0){sc+=c;if(r.rate!=null){sw+=c*r.rate;has=true;}}});
+  let sc=0,sw=0,swc=0,has=false;
+  /* 没填正确率的记录只计题量，不进正确率分母（否则「10题100% + 10题未填」会被算成 50%） */
+  recs.forEach(r=>{const c=r.count||0;if(c>0){sc+=c;if(r.rate!=null){sw+=c*r.rate;swc+=c;has=true;}}});
   rec.count=sc;
-  rec.rate=has?Math.round(sw/sc):(sc>0?null:0);
+  rec.rate=has?Math.round(sw/swc):(sc>0?null:0);
   const subs={};
-  recs.forEach(r=>{ if(r.sub){ const s=subs[r.sub]||{c:0,sw:0,has:false}; s.c+=(r.count||0); if(r.rate!=null){s.sw+=(r.count||0)*r.rate;s.has=true;} subs[r.sub]=s; } });
+  recs.forEach(r=>{ if(r.sub){ const c=r.count||0; const s=subs[r.sub]||{c:0,sw:0,wc:0,has:false}; s.c+=c; if(r.rate!=null){s.sw+=c*r.rate;s.wc+=c;s.has=true;} subs[r.sub]=s; } });
   rec.subs={};
-  Object.keys(subs).forEach(n=>{const s=subs[n];if(s.c>0)rec.subs[n]={count:s.c,rate:s.has?Math.round(s.sw/s.c):null};});
+  Object.keys(subs).forEach(n=>{const s=subs[n];if(s.c>0)rec.subs[n]={count:s.c,rate:s.has?Math.round(s.sw/s.wc):null};});
   if(!Object.keys(rec.subs).length)delete rec.subs;
 }
 /* 老数据（只有 count/rate/subs，没有 records）首次交互时，反推成一条 records，避免丢失 */
-function seedRecordsIfLegacy(rec){
+function seedRecordsIfLegacy(rec,seedKey){
   if(!rec||rec.records)return rec;
+  /* 反推出来的老记录也要有稳定身份：两端各自反推时 rid 必须一致，
+     否则一端删掉写墓碑、另一端同步时认不出同一条，记录会复活。
+     seedKey 用「日期|模块」两端可复现；ts 保持 0，避免并集把同一条算成两条。 */
+  const _key=String(seedKey||'legacy');
+  const _mk=function(sub,count,rate){
+    return {rid:'lg:'+_key+'|'+(sub||'__overall__'),sub:sub||null,
+      count:numOr(count,0),rate:rate==null?null:numOr(rate,null),ts:0,ets:0};
+  };
   rec.records=[];
   if(rec.subs&&Object.keys(rec.subs).length){
-    Object.keys(rec.subs).forEach(n=>rec.records.push({sub:n,count:rec.subs[n].count||0,rate:rec.subs[n].rate==null?null:rec.subs[n].rate}));
-  } else if(rec.count>0){
-    rec.records.push({sub:null,count:rec.count||0,rate:rec.rate==null?null:rec.rate});
+    Object.keys(rec.subs).forEach(function(n){
+      const s=rec.subs[n]||{};
+      rec.records.push(_mk(n,s.count,s.rate));
+    });
+  } else if(numOr(rec.count,0)>0){
+    rec.records.push(_mk(null,rec.count,rec.rate));
   }
-  if(!rec.records.length)rec.records=[];
   return rec;
 }
 function openTaskReport(task,mode,todoId,entry,editIdx){
@@ -4960,7 +5311,10 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
   let entryBody;
   if(editing){
     // 编辑单条：只改该条的 题量/正确率/时长，sub 保留 editRec.sub（忽略拆分/子模块复杂逻辑）
-    entryBody=`<div class="rep-card">${hero(mainCount,heroRate(editRec.rate,false),false)}${chips}</div>`;
+    // 拆分模块下 hero 不渲染时长栏、编辑模式又没有子模块行，必须单独补一个：
+    // 否则保存时读不到 #dsMinutes，会被「请填写学习时长」拦住，改题量/正确率永远存不上。
+    const _editMinRow=isSplit?`<div class="rep-time-row"><label class="rep-label">学习时长<i class="req">*</i></label><div class="rep-input"><input type="number" id="dsMinutes" class="field rep-num" min="0" inputmode="numeric" placeholder="0" value="${pomoMin||''}"><span class="rep-suffix">分钟</span></div></div>`:'';
+    entryBody=`<div class="rep-card">${hero(mainCount,heroRate(editRec.rate,false),false)}${chips}${_editMinRow}</div>`;
   } else if(t.sub){
     entryBody=`<div class="rep-card"><div id="singleWrap">${hero(svCount,heroRate(sv.rate,false),false)}${chips}</div>${_batchWrapHtml}</div>`;
   } else if(!isSplit){
@@ -5018,6 +5372,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     const i=parseInt(b.dataset.ri,10);
     const dd=todayStr();const st=state.dailyStats[dd]&&state.dailyStats[dd][t.sec];
     if(st&&st.records){const _rm=st.records[i]||{};st.records.splice(i,1);
+      const _dk=recDelKey(_rm);if(_dk)markEntityDeleted('brec',[_dk]);   // 跨端删除标记，防止对端同步时复活
       // 删掉一条记录同时扣掉它的时长，否则分批/拆分录入后删笔，模块时长仍虚高
       if(_rm.min>0){st.minutes=Math.max(0,(st.minutes||0)-_rm.min);if(st.minutes<=0)delete st.minutes;}
       recomputeDailyStat(t.sec,dd);if(!st.records.length)delete state.dailyStats[dd][t.sec];if(Object.keys(state.dailyStats[dd]||{}).length===0)delete state.dailyStats[dd];save();render();openTaskReport(t, dsMode, _completeTodoId);}
@@ -5201,8 +5556,12 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
       if(_newMin<=0){toast('请填写学习时长（番茄钟自动带入，或手动填分钟数）');return;}
       const _rec2=state.dailyStats[d][t.sec];
       _rec2.records.splice(editIdx,1);
-      const _bkKeep=editRec.bkId?{bkId:editRec.bkId,bkN:(editRec.bkN==null?null:editRec.bkN)}:{};
-      _rec2.records.push(Object.assign({sub:editRec.sub,count:count,rate:dsNeedRate?rate:null,min:_newMin,ts:Date.now()},_bkKeep));
+      const _bkKeep={};
+      if(editRec.bkId){_bkKeep.bkId=editRec.bkId;_bkKeep.bkN=(editRec.bkN==null?null:editRec.bkN);}
+      if(editRec.rid)_bkKeep.rid=editRec.rid;   // 保留记录身份，删除墓碑才认得出这一条
+      /* 编辑保留原 ts：跨设备合并按 ts+sub 认「同一条记录」，若换新 ts 会被当成新记录并集进来、题量翻倍。
+         ets 记录编辑时间，两端都改过时取编辑更晚的一份。 */
+      _rec2.records.push(Object.assign({sub:editRec.sub,count:count,rate:dsNeedRate?rate:null,min:_newMin,ts:editRec.ts||Date.now(),ets:Date.now()},_bkKeep));
       // 改时长要同步模块总时长（原来只改记录不改 minutes，改完今日时长不变）
       const _delta=_newMin-(editRec.min||0);
       if(_delta){_rec2.minutes=Math.max(0,(_rec2.minutes||0)+_delta);if(_rec2.minutes<=0)delete _rec2.minutes;}
@@ -5376,7 +5735,7 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     if(!state.dailyStats[d])state.dailyStats[d]={};
     if(!state.dailyStats[d][t.sec])state.dailyStats[d][t.sec]={count:0,rate:0,subs:{},records:[]};
     const rec=state.dailyStats[d][t.sec];
-    seedRecordsIfLegacy(rec);
+    seedRecordsIfLegacy(rec,d+'|'+t.sec);
     if(!rec.records)rec.records=[];
     const _oldMin=rec.minutes||0;
     /* 覆盖模式：大类(含拆分模块)整段替换当天该模块记录；子模块任务只替换该子模块。
@@ -5400,6 +5759,8 @@ function openTaskReport(task,mode,todoId,entry,editIdx){
     if(isSplit && isAdd && newRecs.some(r=>r.sub)){
       rec.records=rec.records.filter(r=>r.sub!==null);
     }
+    /* 每条新建记录给一个稳定身份，删除时才能写墓碑（老数据没有 rid，靠 ts|sub 兜底） */
+    newRecs.forEach(function(r){if(!r.rid)r.rid=uid();});
     if(_bk)newRecs.forEach(function(r){r.bkId=_bk.id;if(_bk.n!=null)r.bkN=_bk.n;});
     rec.records=rec.records.concat(newRecs);
     // 由 records 重算汇总（count/rate/subs），今日汇总与查看详情都读它，保证对得上
@@ -5486,8 +5847,9 @@ function openReportBySection(sec,todoId,entry,bk){
     if(_at && (_at.section===sec||!sec)){ openTaskReport({id:_at.id,type:'module',sec:_at.section,sub:_at.sub||null,count:_at.count||0,name:_at.text||_at.name,__bk:bk},'add',_at.id,entry); return; }
   }
   // 未显式带待办时：该模块恰好有一个「未完成且填了题量」的关联待办 → 自动带出（首页/模块页记一笔也能锁待办题量）；多个时不猜，保持原样
+  // 练习册入口（bk）不自动认领待办：否则会把无关的「30 题」待办锁死题量并在保存时静默勾掉
   let _autoSub=null;
-  if(!todoId){
+  if(!todoId&&!bk){
     // 重复任务今天已完成（lastDone=今天）的排除：它 done 恒为 false，旧逻辑会误锁题量
     const _matches=(state.todos||[]).filter(_p=>_p.section===sec&&!_p.done&&_p.count>0&&!(isRepeat(_p)&&_p.lastDone===todayStr()));
     if(_matches.length===1){todoId=_matches[0].id;_autoSub=_matches[0].sub||null;}
@@ -6148,7 +6510,9 @@ function renderReview(c){
   }catch(e1){
     console.error('buildBlendModel error:', e1);
     if(typeof toast==='function')toast('复盘数据出错：'+(e1.message||e1),'error',6000);
-    // 仍继续渲染，确保子 tab 与历史等不依赖 model 的部分能用
+    /* 兜一个结构完整的空 model：原来只 catch 不兜，下面 model.dates 会再抛一次，
+       整张数据页直接白屏（一条坏套卷记录就能触发）。 */
+    model=emptyBlendModel();
   }
   const d=todayStr();
   const t=d;
@@ -6208,9 +6572,10 @@ function renderReview(c){
   {
     const ov=model.overall;
     const fR=v=>v!=null?Math.round(v*100)+'%':'—';
-    const blendedAll=ov.exam.t+ov.daily.t>0?(ov.exam.c+ov.daily.c)/(ov.exam.t+ov.daily.t):null;
+    const blendedW=ov.exam.t+(ov.daily.wc||0);
+    const blendedAll=blendedW>0?(ov.exam.c+ov.daily.c)/blendedW:null;
     const examAll=ov.exam.t>0?ov.exam.c/ov.exam.t:null;
-    const dailyAll=ov.daily.t>0?ov.daily.c/ov.daily.t:null;
+    const dailyAll=(ov.daily.wc||0)>0?ov.daily.c/ov.daily.wc:null;
     const sumCard=el('div','card');
     sumCard.innerHTML=`<div class="section-title"><span class="dot"></span>综合正确率</div>
       <div class="blend-row">
@@ -6331,7 +6696,10 @@ function doImport(data){
   const localTodos=Array.isArray(state.todos)?state.todos.slice():[];
   const localTT=Array.isArray(state.timetable)?state.timetable.slice():[];
   const localExams=Array.isArray(state.exams)?state.exams.slice():[];
-  const localCourses=Array.isArray(state.courses)?state.courses.slice():[];
+  /* 删除墓碑 / 课表生成日志先快照：导入不能把它们整体替换（旧备份会把之后删掉的待办、课程、课表复活） */
+  const localDeletedTodos=Array.isArray(state.deletedTodoIds)?state.deletedTodoIds.slice():[];
+  const localDeletedEnt=(state.deletedEntities&&typeof state.deletedEntities==='object'&&!Array.isArray(state.deletedEntities))?JSON.parse(JSON.stringify(state.deletedEntities)):{};
+  const localTtLog=(state.ttTodoLog&&typeof state.ttTodoLog==='object'&&!Array.isArray(state.ttTodoLog))?Object.assign({},state.ttTodoLog):{};
   const localCustom={};
   Object.keys(state.customData||{}).forEach(k=>{
     if(Array.isArray(state.customData[k]))localCustom[k]=state.customData[k].slice();
@@ -6372,6 +6740,32 @@ function doImport(data){
   if(!state.customData||typeof state.customData!=='object')state.customData={};
   if(!Array.isArray(state.exams)||!state.exams.length)state.exams=EXAMS.map(e=>({key:e.key,name:e.name,date:e.date}));
   if(!state.periodReviews||typeof state.periodReviews!=='object')state.periodReviews={};
+  /* 墓碑只增不减：与本地快照取并集。否则导入旧备份会让「之后删掉的待办/课程/课表」在下次同步时复活 */
+  state.deletedTodoIds=deletedTodosToArray(collectDeletedTodos(localDeletedTodos,Array.isArray(state.deletedTodoIds)?state.deletedTodoIds:[]));
+  if(!state.deletedEntities||typeof state.deletedEntities!=='object'||Array.isArray(state.deletedEntities))state.deletedEntities={};
+  const _delKinds=Object.keys(localDeletedEnt);
+  Object.keys(state.deletedEntities).forEach(function(k){if(_delKinds.indexOf(k)<0)_delKinds.push(k);});
+  _delKinds.forEach(function(k){
+    const m=entityDelMap(k,{deletedEntities:localDeletedEnt},{deletedEntities:state.deletedEntities});
+    state.deletedEntities[k]=entityDelArray(m);
+  });
+  /* 导入旧备份后按删除墓碑清掉已删的单条刷题记录（墓碑已取并集，不会被旧备份抹掉）。
+     套卷壳 records 恒为空、派生自 examRecords，不能按「无明细」删。 */
+  (function(){
+    const dm=entityDelMap('brec',state,null);
+    if(!dm.size)return;
+    Object.keys(state.dailyStats||{}).forEach(function(d){
+      const day=state.dailyStats[d];if(!day||typeof day!=='object')return;
+      Object.keys(day).forEach(function(sec){
+        const s=day[sec];if(!s||!Array.isArray(s.records))return;
+        s.records=s.records.filter(function(r){const k=recDelKey(r);return !k||!dm.has(k)||!(dm.get(k)>(r.ts||0));});
+        if(s.records.length)recomputeDailyStat(sec,d);else if(sec!=='taojuan')delete day[sec];
+      });
+      if(!Object.keys(day).length)delete state.dailyStats[d];
+    });
+  })();
+  /* 导入旧备份同样会把「已删练习册」的 bkId 带回来：按并集后的课程墓碑再摘一次标记，成绩不删 */
+  stripDeadBookletRefs(state,entityDelMap('course',state,null));
   const cdKeys=Object.keys(IMPORT_MODULE_NAMES);
   cdKeys.forEach(k=>{if(!state.customData[k])state.customData[k]=[];});
   let dedupCount=0;
@@ -6413,19 +6807,48 @@ function doImport(data){
     const newTT=importTT.filter(x=>!(x&&x.id&&ttIds.has(x.id)));
     state.timetable=(state.timetable||[]).concat(newTT);
   }
-  // 课表生成日志 ttTodoLog：key 并集，导入补缺
+  // 课表生成日志 ttTodoLog：key 并集，导入补缺（取较新的时间戳，避免同一天重复生成待办）
   if(data.ttTodoLog&&typeof data.ttTodoLog==='object'&&!Array.isArray(data.ttTodoLog)){
     if(!state.ttTodoLog||typeof state.ttTodoLog!=='object'||Array.isArray(state.ttTodoLog))state.ttTodoLog={};
-    Object.keys(data.ttTodoLog).forEach(function(k){ if(state.ttTodoLog[k]==null)state.ttTodoLog[k]=data.ttTodoLog[k]; });
+    Object.keys(localTtLog).forEach(function(k){
+      if(!(state.ttTodoLog[k]>=localTtLog[k]))state.ttTodoLog[k]=localTtLog[k];
+    });
   }
   /* 课程按 id 并集合并：同 id 的课程保留本地（含已听进度），导入里的新 id 追加。
-     修复：原来 courses 没从 plain 剔除，Object.assign 会用导入数据整体覆盖本地课程，
-     导致本地已听进度丢失。done 数组不做并集（导入备份的 done 可能是旧的），以本地为准。 */
+     同名不同 id（换设备重建/重复添加）不再并存两份：进度按讲号并集并入本地那一本。 */
   const importCourses=Array.isArray(data.courses)?data.courses.filter(c=>c&&c.id):[];
   if(importCourses.length){
-    const localIds=new Set(localCourses.map(c=>c&&c.id).filter(Boolean));
-    const newCourses=importCourses.filter(c=>!localIds.has(c.id));
-    if(newCourses.length)state.courses=(state.courses||[]).concat(newCourses);
+    if(!Array.isArray(state.courses))state.courses=[];
+    const localIds=new Set(state.courses.map(c=>c&&c.id).filter(Boolean));
+    const byName=new Map();
+    state.courses.forEach(function(c){if(c&&c.name)byName.set(String(c.name).trim(),c);});
+    const addedNames=new Set();
+    importCourses.forEach(function(ic){
+      if(localIds.has(ic.id))return;
+      const nm=String(ic.name||'').trim();
+      const same=nm?byName.get(nm):null;
+      if(same){
+        if(!Array.isArray(same.done))same.done=[];
+        const have=new Set(same.done.map(function(d){return (typeof d==='number')?d:(d&&d.n);}).filter(function(n){return typeof n==='number';}));
+        (Array.isArray(ic.done)?ic.done:[]).forEach(function(d){
+          const n=(typeof d==='number')?d:(d&&d.n);
+          if(typeof n!=='number'||have.has(n))return;
+          have.add(n);
+          same.done.push({n:n,ts:(d&&d.ts)||Date.now(),date:(d&&d.date)||todayStr()});
+        });
+        // 本地缺的元数据用导入补齐，已有的（可能是新改的）不覆盖
+        if(!same.teacher&&ic.teacher)same.teacher=ic.teacher;
+        if(!same.section&&ic.section)same.section=ic.section;
+        if(!(+same.total>0)&&+ic.total>0)same.total=ic.total;
+        same.mts=Date.now();
+        return;
+      }
+      if(nm&&addedNames.has(nm))return;   // 导入文件自身也别出现两本同名
+      if(nm)addedNames.add(nm);
+      state.courses.push(ic);
+      localIds.add(ic.id);
+      if(nm)byName.set(nm,ic);
+    });
   }
   // 考试定义按 key 并集：导入文件若只含旧数据，本地新增的自定义考试不会被覆盖丢失
   if(localExams.length&&Array.isArray(state.exams)){
@@ -6434,7 +6857,7 @@ function doImport(data){
   }
   // 导入后补跑迁移与数组守卫：老版本备份可能是对象形态 todos，
   // 启动时的守卫不会在导入后重跑，这里补一次避免 .filter 崩溃
-  migrateTodos();ensureArrayList();
+  migrateTodos();ensureArrayList();normalizeStats();
   // 关键：导入备份后，让「刚导入的完整数据」成为时间戳最新的数据源。
   // 否则本地 _syncTs 还是旧的（可能被污染成很低的值），另台开着的轮询一发现云端更高
   // 就会用旧/空数据把刚导入的覆盖掉 —— 这正是"导入了又被吞"的根源。
@@ -6629,7 +7052,10 @@ function renderMine(c){
     if(syncCfg&&(syncCfg.apiKey||syncCfg.token)){
       // 如果同步配置存在于其他字段，也删除
       Object.keys(exportData).forEach(k=>{
-        if(exportData[k]&&(exportData[k].apiKey||exportData[k].token))delete exportData[k].apiKey;
+        if(!exportData[k]||typeof exportData[k]!=='object')return;
+        delete exportData[k].apiKey;
+        delete exportData[k].token;
+        delete exportData[k].access_token;
       });
     }
     const blob=new Blob([JSON.stringify(exportData,null,2)],{type:'application/json'});
@@ -6671,10 +7097,19 @@ function renderMine(c){
   const clearBtn=el('button','btn btn-danger btn-sm');
   clearBtn.innerHTML=`${icon('trash')} 清空数据`;
   clearBtn.addEventListener('click',()=>{
-    uiConfirm('此操作将清空全部本地数据（打卡、复盘、待办、题库内容等），恢复到初始状态，且不可恢复。确定继续？',()=>{
+    // 有云端同步时说明：云端备份不会被清掉，重开会自动拉回来（想彻底清空要先断开同步）
+    const _synced=!!getSyncCfg();
+    uiConfirm('此操作将清空全部本地数据（打卡、复盘、待办、题库内容等），恢复到初始状态，且不可恢复。'
+      +(_synced?'注意：云端备份不会被删除，重新打开后会从云端同步回来；如需彻底清空，请先断开云端同步。':''),()=>{
       uiConfirm('最后确认：真的要清空所有数据吗？',()=>{
         window.__CLEARING=true; // 标记清空中，阻止 beforeunload/pagehide 的 persistPomo 写回旧数据
-        try{localStorage.removeItem(STORE_KEY);}catch(e){}
+        try{
+          localStorage.removeItem(STORE_KEY);
+          /* 脏标记必须一起清掉：否则重开后 initSync 会认为「上次没推完」，
+             网络异常时直接把空状态推上云端，覆盖掉云端备份 */
+          localStorage.removeItem('shangan_dirty');
+        }catch(e){}
+        dirtySincePush=false;
         location.reload();
       },{danger:true});
     },{danger:true});
@@ -8228,6 +8663,7 @@ function openTargetModal(presetKey){
     if(wTrim===''){toast(isSl?'请填目标得分率':'请填目标正确率（不需要目标可点「清除目标」）');return;}
     const w=parseInt(wTrim,10);
     if(isNaN(w)||w<0||w>100){toast('正确率请输入 0-100 之间的数字');return;}
+    const _now=Date.now();   // 提到块外：申论(isSl)分支也要用，原来只在 !isSl 里声明会 ReferenceError
     if(!isSl){
       /* 行测：时长、题量同样必填，三项配齐才能算标准速度 */
       if(minInp.value.trim()===''||cntInp.value.trim()===''){toast('时长和题量也要一起填（时长 ÷ 题量 = 每题标准速度）');return;}
@@ -8239,7 +8675,6 @@ function openTargetModal(presetKey){
       if(!state.countTargets)state.countTargets={};
       if(!state.durTargetsMts)state.durTargetsMts={};
       if(!state.countTargetsMts)state.countTargetsMts={};
-      const _now=Date.now();
       state.durTargets[key]=n;state.countTargets[key]=c;
       state.durTargetsMts[key]=_now;state.countTargetsMts[key]=_now;
     }
@@ -8538,31 +8973,35 @@ function getRecentDates(n){
    dailyStats 结构为 {count, rate}（rate 已是 0-100）；无有效数据时返回 null。
    首页 / 每日计划 / 总结 三处共用，避免各写一套导致口径漂移。 */
 function weightedAccuracy(entries,countRef){
-  let total=0,weighted=0;
+  let total=0,weighted=0,wc=0;
   (entries||[]).forEach(s=>{
-    const c=(s&&s.count)||0;
+    const c=numOr(s&&s.count,0);
     if(c<=0)return;
     total+=c;
-    if(s.rate!=null)weighted+=c*s.rate;
+    /* 未填正确率只计总题量，不进正确率分母；非法值也不许把加权和污染成 NaN */
+    const r=(s&&s.rate)!=null?numOr(s.rate,null):null;
+    if(r!=null){weighted+=c*r;wc+=c;}
   });
   if(countRef)countRef.total=total;
-  return total>0?Math.round(weighted/total):null;
+  return wc>0?Math.round(weighted/wc):null;
 }
 function calcPeriodStats(dates){
   // 原 calcDayLearning 只是 dayTotalMin 的转发，直接调用即可；套卷按题数加权并入
   let totalMin=0;const entries=[];
   const set=new Set(dates);
   dates.forEach(d=>{
-    totalMin+=dayTotalMin(d);
+    totalMin+=numOr(dayTotalMin(d),0);
     const day=state.dailyStats[d]||{};
-    Object.keys(day).filter(isQSec).forEach(k=>entries.push(day[k]));
-    // 并入区间内的套卷(moduleStats 按题数加权)
-    (state.examRecords||[]).forEach(r=>{
-      if(!set.has(r.date)||!r.moduleStats)return;
-      Object.keys(r.moduleStats).forEach(et=>{
-        const m=r.moduleStats[et]; if(!m||!m.total)return;
-        entries.push({count:m.total, rate:Math.round(m.correct/m.total*100)});
-      });
+    Object.keys(day).filter(isQSec).forEach(k=>entries.push(day[k]||{}));
+  });
+  /* 套卷在区间内只计一次：原来放在 dates.forEach 里，每条日期都把全部套卷再推一遍，
+     N 天区间同一套卷被算 N 次（2 天 40 题 → 80 题）。 */
+  (state.examRecords||[]).forEach(r=>{
+    if(!r||!set.has(r.date)||!r.moduleStats)return;
+    Object.keys(r.moduleStats).forEach(et=>{
+      const m=r.moduleStats[et]; if(!m)return;
+      const t=numOr(m.total,0); if(!(t>0))return;
+      entries.push({count:t, rate:Math.round(numOr(m.correct,0)/t*100)});
     });
   });
   const countRef={total:0};
@@ -8578,13 +9017,23 @@ function calcPeriodStats(dates){
 function countUnitInRange(dates){
   const set=new Set(dates);
   const out={};
+  /* 申论「录得分」只写 shenlunReviews、不写 dailyStats（与首页口径一致）：按天取两者较大值，避免同一天重复计 */
+  const revByDate={};
+  (state.shenlunReviews||[]).forEach(r=>{if(r&&set.has(r.date))revByDate[r.date]=(revByDate[r.date]||0)+1;});
   Object.keys(state.dailyStats||{}).forEach(d=>{
     if(!set.has(d))return;
     Object.entries(state.dailyStats[d]||{}).forEach(([k,s])=>{
       if(isQSec(k))return;
-      const c=s.count||0;if(!c)return;
+      let c=numOr(s&&s.count,0);
+      if(k==='shenlun'&&revByDate[d]>c)c=revByDate[d];
+      if(!c)return;
       out[k]=(out[k]||0)+c;
     });
+  });
+  // 只有批改记录、没写 dailyStats 的日期
+  Object.keys(revByDate).forEach(d=>{
+    const sl=(state.dailyStats[d]||{}).shenlun;
+    if(!(sl&&sl.count>0))out.shenlun=(out.shenlun||0)+revByDate[d];
   });
   return out;
 }
@@ -8598,14 +9047,15 @@ function pctChange(cur,prev){
 function drawLineChart(series,labels,unit,height=140){
   const w=320,h=height,pad={t:15,r:15,b:38,l:35};
   const cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
-  const allValid=series.flatMap(s=>s.data).filter(v=>v!==null&&v!==undefined);
+  const clean=v=>{if(v==null)return null;const n=numOr(v,null);return (n!=null&&isFinite(n))?n:null;};
+  const allValid=series.flatMap(s=>s.data.map(clean)).filter(v=>v!=null);
   if(allValid.length===0)return `<div class="empty-tip" style="padding:20px 0;">暂无数据</div>`;
   const max=Math.max(...allValid,unit==='%'?100:1),min=0;
   const x=i=>pad.l+(cw/(labels.length-1||1))*i;
   const y=v=>pad.t+ch-(v-min)/(max-min||1)*ch;
   let paths='',dots='';
   series.forEach(s=>{
-    const pts=s.data.map((v,i)=>(v===null||v===undefined)?null:{x:x(i),y:y(v),v});
+    const pts=s.data.map((v,i)=>{const cv=clean(v);return cv==null?null:{x:x(i),y:y(cv),v:cv};});
     const vp=pts.filter(p=>p);
     if(vp.length===0)return;
     let d='';vp.forEach((p,i)=>{d+=(i?'L':'M')+p.x.toFixed(1)+','+p.y.toFixed(1)+' ';});
@@ -8637,27 +9087,28 @@ const ET2SEC={}; // 题型 key → 每日计划模块 key（真正填充见下�
 function getWeakPoints(){
   const stats={};
   const add=(key,count,acc,minutes)=>{
-    if(!stats[key])stats[key]={count:0,weighted:0,minutes:0};
+    if(!stats[key])stats[key]={count:0,weighted:0,wc:0,minutes:0};
     stats[key].count+=count;
-    if(count>0)stats[key].weighted+=count*acc;
+    if(count>0&&acc!=null){stats[key].weighted+=count*acc;stats[key].wc+=count;}
     stats[key].minutes+=(minutes||0);
   };
-  // 1) 每日刷题（原有）
+  // 1) 每日刷题：套卷/申论/晨读派生壳是「套/篇/次」，不能当考点算进薄弱分析
   Object.entries(state.dailyStats||{}).forEach(([date,ds])=>{
-    Object.entries(ds).forEach(([key,s])=>{
-      const c=s.count||0; if(c<=0)return;
-      const r=(s.rate!=null)?s.rate:0;
-      add(key,c,r,s.minutes||0);
+    Object.entries(ds||{}).forEach(([key,s])=>{
+      if(!isQSec(key))return;
+      const c=numOr(s&&s.count,0); if(c<=0)return;
+      add(key,c,(s&&s.rate)!=null?numOr(s.rate,null):null,numOr(s&&s.minutes,0));
     });
   });
   // 2) 粉笔导入的套卷：用 moduleStats（按题数加权，最准）
   (state.examRecords||[]).forEach(r=>{
-    const ms=r.moduleStats; if(!ms)return;
+    const ms=r&&r.moduleStats; if(!ms)return;
     Object.keys(ms).forEach(et=>{
       const sec=ET2SEC[et]; if(!sec)return;
-      const m=ms[et]; if(!m||!m.total)return;
-      const acc=Math.round(m.correct/m.total*100);
-      add(sec,m.total,acc,0);
+      const m=ms[et]; if(!m)return;
+      const t=numOr(m.total,0); if(!(t>0))return;
+      const acc=Math.round(numOr(m.correct,0)/t*100);
+      add(sec,t,acc,0);
     });
   });
   return Object.entries(stats)
@@ -8665,10 +9116,11 @@ function getWeakPoints(){
       key,
       name:SECTION_MAP[key]?.name||key,
       count:s.count,
-      accuracy:s.count>0?Math.round(s.weighted/s.count):0,
-      minutes:s.minutes
+      accuracy:s.wc>0?Math.round(s.weighted/s.wc):0,
+      minutes:s.minutes,
+      wc:s.wc
     }))
-    .filter(x=>x.count>0)
+    .filter(x=>x.count>0&&x.wc>0)
     .sort((a,b)=>a.accuracy-b.accuracy);
 }
 
@@ -8690,13 +9142,13 @@ function getModuleAccuracy(key){
     const subObj=(SECTION_ET[sec]&&SECTION_ET[sec].subs||[]).find(x=>x.key===key||x.name===key);
     const subNm=subObj?subObj.name:key;
     const subKey=subObj?subObj.key:key;
-    let count=0,weighted=0;
+    let weighted=0,wc=0;
     Object.values(state.dailyStats||{}).forEach(ds=>{
       const s=ds[sec]; if(!s||!s.subs)return;
       const sv=s.subs[subNm]||s.subs[subKey]; if(!sv||!(sv.count>0))return;
-      count+=sv.count; if(sv.rate!=null)weighted+=sv.count*sv.rate;
+      if(sv.rate!=null){weighted+=sv.count*sv.rate;wc+=sv.count;}
     });
-    return count>0?Math.round(weighted/count):null;
+    return wc>0?Math.round(weighted/wc):null;
   }
   // 兼容两种 key：中文题型名（'资料分析'→ET_TO_SEC）与英文模块 key（'ziliao'→SECTION_ET 自证）。
   // 六维雷达传的是英文 key，过去只查 ET_TO_SEC 会查不到 → 永远返回 null，雷达全空。
@@ -8720,7 +9172,9 @@ function renderKeepScroll(){
 }
 function dateRange(s,e){
   const out=[];let d=s;let guard=0;
-  while(d<=e&&guard++<800){out.push(d);d=addDays(d,1);}
+  /* 「全部」周期可能跨越好几年：原来上限 800 天会把末尾数据静默丢掉（标题却仍写全区间）。
+     上限放到 5000 天（13 年），足够覆盖任何真实备考记录，循环仍可控。 */
+  while(d<=e&&guard++<5000){out.push(d);d=addDays(d,1);}
   return out;
 }
 function periodRange(kind){
@@ -8742,62 +9196,78 @@ function periodRange(kind){
     const start=addDays(t,-29);
     return {key:'d30:'+start,label:`${start} ~ ${t}`,start,end:t,prevStart:addDays(start,-30),prevEnd:addDays(start,-1),prevLabel:'较前30天'};
   }
-  const all=[...new Set(Object.keys(state.dailyStats||{}).concat(Object.keys(state.studyRecords||{})))].sort();
-  return {key:'all',label:all.length?`${all[0]} ~ ${all[all.length-1]}`:'暂无数据',start:all[0]||t,end:all[all.length-1]||t,prevStart:null,prevEnd:null,prevLabel:'—'};
+  /* 「全部」按「真正有数据的日期」统计，不再生成 start~end 的连续区间：
+     ① 导入的脏备份里混进非法日期键（'abc'）会把标题写乱、还白跑几千天循环；
+     ② 连续区间有天数上限，跨十几年会被静默截断。这里只留合法日期并去重排序。 */
+  const all=[...new Set(Object.keys(state.dailyStats||{}).concat(
+    Object.keys(state.studyRecords||{}),
+    (state.examRecords||[]).map(r=>r&&r.date).filter(Boolean),
+    (state.shenlunReviews||[]).map(r=>r&&r.date).filter(Boolean)
+  ))].filter(function(d){
+    return /^\d{4}-\d{2}-\d{2}$/.test(d)&&!isNaN(new Date(d+'T00:00:00').getTime());
+  }).sort();
+  return {key:'all',label:all.length?`${all[0]} ~ ${all[all.length-1]}`:'暂无数据',start:all[0]||t,end:all[all.length-1]||t,dates:all,prevStart:null,prevEnd:null,prevLabel:'—'};
 }
 /* 区间内各模块的加权正确率与题量（每日刷题 + 套卷，与薄弱考点算法一致） */
 function statsInRange(dates){
   const set=new Set(dates);
   const stats={};
   const add=(key,count,acc)=>{
-    if(!stats[key])stats[key]={count:0,w:0};
+    if(!stats[key])stats[key]={count:0,w:0,wc:0};
     stats[key].count+=count;
-    if(count>0)stats[key].w+=count*acc;
+    /* 没填正确率的记录只计题量，不按 0% 参与加权，否则会凭空拉低模块正确率 */
+    if(count>0&&acc!=null){stats[key].w+=count*acc;stats[key].wc+=count;}
   };
   Object.keys(state.dailyStats||{}).forEach(d=>{
     if(!set.has(d))return;
     Object.entries(state.dailyStats[d]||{}).forEach(([k,s])=>{
       // 申论记「篇」、套卷记「套」、晨读记「次」，都不算进刷题量和加权正确率
       if(!isQSec(k))return;
-      const c=s.count||0;if(c>0)add(k,c,(s.rate!=null)?s.rate:0);
+      const c=numOr(s&&s.count,0);if(c>0)add(k,c,(s&&s.rate)!=null?numOr(s.rate,null):null);
     });
   });
   (state.examRecords||[]).forEach(r=>{
-    if(!set.has(r.date))return;
+    if(!r||!set.has(r.date))return;
     const ms=r.moduleStats;if(!ms)return;
     Object.keys(ms).forEach(et=>{
       const sec=ET2SEC[et];if(!sec)return;
-      const m=ms[et];if(!m||!m.total)return;
-      add(sec,m.total,Math.round(m.correct/m.total*100));
+      const m=ms[et];if(!m)return;
+      const t=numOr(m.total,0);if(!(t>0))return;
+      add(sec,t,Math.round(numOr(m.correct,0)/t*100));
     });
   });
   return stats;
 }
 function periodSummary(dates){
   let minutes=0,sessions=0;
+  /* 套卷/申论得分可能只有独立记录，没有 dailyStats 壳，也算有学习记录 */
+  const extraActive=new Set();
+  (state.examRecords||[]).forEach(r=>{if(r&&r.date)extraActive.add(r.date);});
+  (state.shenlunReviews||[]).forEach(r=>{if(r&&r.date)extraActive.add(r.date);});
   dates.forEach(d=>{
-    minutes+=dayTotalMin(d);
+    minutes+=numOr(dayTotalMin(d),0);
     // 专注次数以独立计数器 focusCount 为准（番茄钟→录成绩后 session 被消费防时长双算，
     // 但次数不能丢）；旧数据没有该字段时回退为 sessions 段数
-    const _sr=state.studyRecords[d];
-    sessions+=(_sr&&typeof _sr.focusCount==='number')?_sr.focusCount:(((_sr||{}).sessions||[]).length);
+    const _sr=(state.studyRecords||{})[d];
+    sessions+=(_sr&&_sr.focusCount!=null)?numOr(_sr.focusCount,0):(((_sr||{}).sessions||[]).length);
   });
   const stats=statsInRange(dates);
-  let count=0,w=0;
-  Object.values(stats).forEach(s=>{count+=s.count;w+=s.w;});
+  let count=0,w=0,wc=0;
+  Object.values(stats).forEach(s=>{count+=s.count;w+=s.w;wc+=s.wc;});
   return {
     minutes,sessions,
     hours:+(minutes/60).toFixed(1),
     count,
-    accuracy:count>0?Math.round(w/count):null,
-    activeDays:dates.filter(d=>dayTotalMin(d)>0).length,
+    accuracy:wc>0?Math.round(w/wc):null,
+    /* 有时长、题量/打卡，或独立套卷/申论记录，都算有学习记录 */
+    activeDays:dates.filter(d=>extraActive.has(d)||numOr(dayTotalMin(d),0)>0||Object.keys(state.dailyStats[d]||{}).some(k=>numOr(((state.dailyStats[d]||{})[k]||{}).count,0)>0)).length,
     stats
   };
 }
 function renderPeriodReview(){
   const card=el('div','card');card.id='learningOverviewCard';
   const p=periodRange(_periodKind);
-  const dates=dateRange(p.start,p.end);
+  const dates=p.dates||dateRange(p.start,p.end);
   const cur=periodSummary(dates);
   const prev=p.prevStart?periodSummary(dateRange(p.prevStart,p.prevEnd)):null;
   const delta=(a,b,unit)=>{
@@ -8815,7 +9285,8 @@ function renderPeriodReview(){
   card.appendChild(chips);
   const range=el('div','muted');
   range.style.fontSize='12px';
-  range.textContent=`${p.label} · ${dates.length} 天 · 有学习记录 ${cur.activeDays} 天`;
+  const spanTxt=p.dates?('共 '+dates.length+' 天有数据'):(dates.length+' 天 · 有学习记录 '+cur.activeDays+' 天');
+  range.textContent=`${p.label} · ${spanTxt}`;
   card.appendChild(range);
   const grid=el('div','overview-grid');
   grid.innerHTML=`
@@ -8848,23 +9319,23 @@ function renderPeriodReview(){
     ROW_KEYS.forEach(k=>{
       const s=cur.stats[k];
       if(!s||!s.count)return;
-      const a=Math.round(s.w/s.count);
+      const a=s.wc>0?Math.round(s.w/s.wc):null;
       const ps=prev&&prev.stats[k];
-      const pa=ps?Math.round(ps.w/ps.count):null;
-      const d=(pa!=null)?a-pa:null;
+      const pa=(ps&&ps.wc>0)?Math.round(ps.w/ps.wc):null;
+      const d=(pa!=null&&a!=null)?a-pa:null;
       const col=(SECTION_MAP[k]&&SECTION_MAP[k].color)||'var(--primary)';
       const row=el('div','pr-bar');
       row.innerHTML=`
         <span class="prb-name">${SECTION_MAP[k].name}</span>
         <span class="prb-track"><i style="width:${Math.min(100,a)}%;background:${col};"></i></span>
-        <span class="prb-val">${a}%</span>
+        <span class="prb-val">${a==null?'—':a+'%'}</span>
         <span class="prb-delta">${d==null?'':(d===0?'<span style="color:var(--text-3);">持平</span>':`<span class="${d>0?'ov-up':'ov-down'}">${d>0?'+':''}${d}</span>`)}</span>
         <span class="prb-count">${s.count}题</span>`;
       rows.appendChild(row);
     });
     card.appendChild(rows);
   }
-  // 本周/本月 申论·套卷·晨读 unit 统计（并入自原「学习数据概览」卡）
+  // 近7天/近30天 申论·套卷·晨读 unit 统计（滚动区间，文案别写成「本周/本月」）
   const wkUnits=countUnitInRange(getRecentDates(7));
   const moUnits=countUnitInRange(getRecentDates(30));
   const fmtUnits=(o)=>{
@@ -8873,7 +9344,7 @@ function renderPeriodReview(){
     return parts.length?parts.join(' · '):'暂无';
   };
   const otherBox=el('div','ci-cheer');
-  otherBox.innerHTML=`本周：${fmtUnits(wkUnits)}　｜　本月：${fmtUnits(moUnits)}`;
+  otherBox.innerHTML=`近7天：${fmtUnits(wkUnits)}　｜　近30天：${fmtUnits(moUnits)}`;
   card.appendChild(otherBox);
   // 交互
   chips.querySelectorAll('[data-pk]').forEach(b=>b.addEventListener('click',()=>{
@@ -8941,46 +9412,64 @@ EXAM_TYPES.forEach(t=>{
    - overall：全局 {exam,daily} 聚合
    - rateMap：综合 per-date per-type（0-1），供 renderRateTrend / avgTypeRate / avgSubRate
    根治旧 buildReviewRateMap 的两个 bug：同日套卷覆盖平时、各日期等权平均。 */
+/* 统计模型出错时的空壳：结构必须和 buildBlendModel 返回值一致，
+   否则 renderReview 里 model.dates / renderTypeDashboard 里 model.typeAgg 会二次抛错整页白屏 */
+function emptyBlendModel(){
+  const typeAgg={};EXAM_TYPES.forEach(t=>{typeAgg[t.key]={exam:{t:0,c:0},daily:{t:0,c:0,wc:0}};});
+  return {dates:[],dailyRate:{},examRate:{},blendedRate:{},typeAgg:typeAgg,
+    overall:{exam:{t:0,c:0},daily:{t:0,c:0,wc:0}},rateMap:{}};
+}
 function buildBlendModel(){
   const types=EXAM_TYPES;
-  const typeAgg={};types.forEach(t=>{typeAgg[t.key]={exam:{t:0,c:0},daily:{t:0,c:0}};});
-  const overall={exam:{t:0,c:0},daily:{t:0,c:0}};
+  const typeAgg={};types.forEach(t=>{typeAgg[t.key]={exam:{t:0,c:0},daily:{t:0,c:0,wc:0}};});
+  const overall={exam:{t:0,c:0},daily:{t:0,c:0,wc:0}};
   const dateDaily={},dateExam={},dailyByDate={},examByDate={};
   // 平时
   Object.keys(state.dailyStats||{}).forEach(date=>{
     const day=state.dailyStats[date]||{};
     Object.keys(day).forEach(sec=>{
       if(!isQSec(sec))return;
-      const s=day[sec]||{};const cnt=s.count||0; if(cnt<=0)return;
+      const s=day[sec]||{};const cnt=numOr(s.count,0); if(cnt<=0)return;
       const tn=SECTION_TO_EXAMTYPE[sec]; if(!tn)return;
-      const acc=cnt*(s.rate!=null?s.rate:0)/100;  // 保留浮点，避免正确题数中间四舍五入放大误差（30题75% 不该变 77%）
-      typeAgg[tn].daily.t+=cnt;typeAgg[tn].daily.c+=acc;
-      overall.daily.t+=cnt;overall.daily.c+=acc;
-      (dateDaily[date]=dateDaily[date]||[]).push({count:cnt,rate:(s.rate!=null?s.rate:0)});
+      const rate=s.rate!=null?numOr(s.rate,null):null;
+      const hasRate=rate!=null;
+      const acc=hasRate?cnt*rate/100:0;  // 空率题量保留在 t，但不进 c/wc 的正确率分子与分母
+      typeAgg[tn].daily.t+=cnt;typeAgg[tn].daily.c+=acc;if(hasRate)typeAgg[tn].daily.wc+=cnt;
+      overall.daily.t+=cnt;overall.daily.c+=acc;if(hasRate)overall.daily.wc+=cnt;
+      (dateDaily[date]=dateDaily[date]||[]).push({count:cnt,rate:hasRate?rate:null});
       const db=dailyByDate[date]=dailyByDate[date]||{types:{},subs:{}};
-      db.types[tn]={t:cnt,c:acc};
+      db.types[tn]={t:cnt,c:acc,wc:hasRate?cnt:0};
       if(s.subs)Object.keys(s.subs).forEach(snm=>{
-        const sv=s.subs[snm]; if(!(sv&&(sv.count||0)>0))return;
+        const sv=s.subs[snm]; if(!(sv&&numOr(sv.count,0)>0))return;
         const sub=types.find(t=>t.key===tn); if(!sub||!sub.subs)return;
-        const sb=sub.subs.find(x=>x.name===snm||x.key===snm); if(sb)db.subs[sb.key]={count:sv.count,rate:sv.rate!=null?sv.rate:0};
+        const sb=sub.subs.find(x=>x.name===snm||x.key===snm);
+        if(sb)db.subs[sb.key]={count:numOr(sv.count,0),rate:sv.rate!=null?numOr(sv.rate,null):null};
       });
     });
   });
-  // 套卷
+  // 套卷（坏记录 / 没日期的老数据直接跳过，不许把 'undefined' 塞进趋势 X 轴）
   (state.examRecords||[]).forEach(r=>{
+    if(!r||typeof r!=='object'||!r.date)return;
     const ms=r.moduleStats||{};
     EXAM_TYPES.forEach(t=>{
-      const m=ms[t.key]; if(!m||!m.total)return;
-      typeAgg[t.key].exam.t+=m.total;typeAgg[t.key].exam.c+=m.correct;
-      overall.exam.t+=m.total;overall.exam.c+=m.correct;
-      (dateExam[r.date]=dateExam[r.date]||[]).push({count:m.total,rate:m.correct/m.total*100});
+      const m=ms[t.key]; if(!m)return;
+      const mt=numOr(m.total,0); if(!(mt>0))return;
+      const mc=numOr(m.correct,0);
+      typeAgg[t.key].exam.t+=mt;typeAgg[t.key].exam.c+=mc;
+      overall.exam.t+=mt;overall.exam.c+=mc;
+      (dateExam[r.date]=dateExam[r.date]||[]).push({count:mt,rate:mc/mt*100});
       const eb=examByDate[r.date]=examByDate[r.date]||{types:{},subs:{}};
-      eb.types[t.key]={t:m.total,c:m.correct};
+      const _et=eb.types[t.key]||{t:0,c:0};
+      eb.types[t.key]={t:_et.t+mt,c:_et.c+mc};
       /* 子题型（openExamEditor 录入时挂 moduleStats[大类].subs）：并入当天 subs，
          与每日刷题子模块在 rateMap 里同口径题量加权 */
       if(m.subs)Object.keys(m.subs).forEach(sk=>{
-        const sv=m.subs[sk]; if(!sv||!sv.total)return;
-        eb.subs[sk]={count:sv.total,rate:sv.correct/sv.total*100};
+        const sv=m.subs[sk]; if(!sv)return;
+        const st=numOr(sv.total,0); if(!(st>0))return;
+        /* 同一天可能录入多套卷：累加而不是覆盖，否则只有最后一套进统计 */
+        const es=eb.subs[sk]||{count:0,_c:0};
+        const cnt=es.count+st, cc=(es._c||0)+numOr(sv.correct,0);
+        eb.subs[sk]={count:cnt,_c:cc,rate:cc/cnt*100};
       });
     });
   });
@@ -8999,16 +9488,16 @@ function buildBlendModel(){
     const o=rateMap[d]={};
     const db=dailyByDate[d]||{types:{},subs:{}},eb=examByDate[d]||{types:{},subs:{}};
     EXAM_TYPES.forEach(t=>{
-      const dt=(db.types[t.key]||{}).t||0,dc=(db.types[t.key]||{}).c||0;
+      const dwc=(db.types[t.key]||{}).wc||0,dc=(db.types[t.key]||{}).c||0;
       const et=(eb.types[t.key]||{}).t||0,ec=(eb.types[t.key]||{}).c||0;
-      if(dt+et>0)o[t.key]=(dc+ec)/(dt+et);
-      /* 子题型：平时(db.subs)+套卷(eb.subs) 按题量加权合并成当天一个率 */
+      if(dwc+et>0){o[t.key]=(dc+ec)/(dwc+et);o[t.key+'|n']=dwc+et;}
+      /* 子题型：平时(db.subs)+套卷(eb.subs) 按题量加权合并成当天一个率；空率不进分母 */
       if(t.subs)t.subs.forEach(sub=>{
         const svd=db.subs[sub.key],sve=eb.subs[sub.key];
         let st=0,sc=0;
-        if(svd&&svd.count>0){st+=svd.count;sc+=svd.count*svd.rate/100;}
+        if(svd&&svd.count>0&&svd.rate!=null){st+=svd.count;sc+=svd.count*svd.rate/100;}
         if(sve&&sve.count>0){st+=sve.count;sc+=sve.count*sve.rate/100;}
-        if(st>0)o[sub.key]=sc/st;
+        if(st>0){o[sub.key]=sc/st;o[sub.key+'|n']=st;}
       });
     });
   });
@@ -9035,17 +9524,27 @@ function getModuleRate(rates,t){
   if(t.subs){let sum=0,n=0;t.subs.forEach(s=>{if(rates&&rates[s.key]!=null){sum+=rates[s.key];n++;}});if(n)return sum/n;}
   return null;
 }
-/* 跨日期平均：某题型整体正确率 */
+/* 跨日期平均：某题型整体正确率（按当天题量加权，不能按天等权） */
 function avgTypeRate(rateMap,t){
-  const vals=[];
-  Object.keys(rateMap).forEach(d=>{const v=getModuleRate(rateMap[d],t);if(typeof v==='number')vals.push(v);});
-  return vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:null;
+  let sw=0,st=0;
+  Object.keys(rateMap).forEach(d=>{
+    const v=getModuleRate(rateMap[d],t);
+    if(typeof v!=='number')return;
+    const n=(rateMap[d]&&rateMap[d][t.key+'|n']>0)?rateMap[d][t.key+'|n']:1;
+    sw+=v*n;st+=n;
+  });
+  return st>0?sw/st:null;
 }
-/* 跨日期平均：某个子模块正确率 */
+/* 跨日期平均：某个子模块正确率（按题量加权） */
 function avgSubRate(rateMap,s){
-  const vals=[];
-  Object.keys(rateMap).forEach(d=>{const v=rateMap[d]&&rateMap[d][s.key];if(typeof v==='number')vals.push(v);});
-  return vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:null;
+  let sw=0,st=0;
+  Object.keys(rateMap).forEach(d=>{
+    const o=rateMap[d]||{}, v=o[s.key];
+    if(typeof v!=='number')return;
+    const n=(o[s.key+'|n']>0)?o[s.key+'|n']:1;
+    sw+=v*n;st+=n;
+  });
+  return st>0?sw/st:null;
 }
 
 /* 题型正确率看板：综合（套卷+平时 题量加权）主环 + 套卷/平时拆开看 */
@@ -9054,10 +9553,10 @@ function renderTypeDashboard(model){
   const fR=v=>v!=null?Math.round(v*100)+'%':'—';
   EXAM_TYPES.forEach(t=>{
     const ta=model.typeAgg[t.key];
-    const bt=ta.exam.t+ta.daily.t, bc=ta.exam.c+ta.daily.c;
-    const avg=bt>0?bc/bt:null;
+    const bw=ta.exam.t+(ta.daily.wc||0), bc=ta.exam.c+ta.daily.c;
+    const avg=bw>0?bc/bw:null;
     const er=ta.exam.t>0?ta.exam.c/ta.exam.t:null;
-    const dr=ta.daily.t>0?ta.daily.c/ta.daily.t:null;
+    const dr=(ta.daily.wc||0)>0?ta.daily.c/ta.daily.wc:null;
     const ring=el('div','type-ring');
     const secKey=ET_TO_SEC[t.key];
     const tgt=(secKey&&state.weakTargets&&state.weakTargets[secKey]!=null)?state.weakTargets[secKey]:null;
@@ -9612,9 +10111,11 @@ function renderTypeWeakCard(model){
       if(ct)ct.style.transform=show?'rotate(90deg)':'';
     });
   });
-  // 恢复重绘前展开的子模块：设置目标后不会被折叠回去，能直接看到结果
-  if(_preserveView&&_preserveView.expanded&&_preserveView.expanded.length){
-    _preserveView.expanded.forEach(sec=>{
+  // 恢复重绘前展开的子模块：renderKeepScroll 与 render() 的自动保留滚动都要认，
+  // 否则编辑成绩/存删套卷/云同步回来这些裸 render 会把展开态收掉
+  const _exp=(_autoExpanded&&_autoExpanded.length)?_autoExpanded:((_preserveView&&_preserveView.expanded)||[]);
+  if(_exp.length){
+    _exp.forEach(sec=>{
       const subs=card.querySelectorAll('.weak-sub[data-parent="'+sec+'"]');
       if(!subs.length)return;
       subs.forEach(s=>{s.style.display='';});
@@ -9635,7 +10136,7 @@ function buildExamRecordItem(r){
     return `<span class="exam-chip" style="--c:${t.color}">${t.name} ${Math.round(v*100)}%</span>`;
   }).filter(Boolean).join('');
   let totalNum=0,correctNum=0;
-  EXAM_TYPES.forEach(t=>{const m=(r.moduleStats||{})[t.key]; if(m&&m.total>0){totalNum+=m.total;correctNum+=m.correct;}});
+  EXAM_TYPES.forEach(t=>{const m=(r.moduleStats||{})[t.key]; const mt=m?numOr(m.total,0):0; if(mt>0){totalNum+=mt;correctNum+=numOr(m.correct,0);}});
   item.innerHTML=`
     <div class="exam-item-head">
       <div class="grow">
@@ -9644,7 +10145,7 @@ function buildExamRecordItem(r){
       </div>
       <div class="exam-score">${r.score!=null&&r.score!==''?r.score:'—'}<span class="exam-score-unit">分</span></div>
     </div>
-    ${totalNum>0?`<div class="exam-pct">正确 ${correctNum}/${totalNum} 题 · 总正确率 ${Math.round(correctNum/totalNum*100)}%</div>`:''}
+    ${totalNum>0?`<div class="exam-pct">正确 ${correctNum}/${totalNum} 题 · 总正确率 ${Math.round(correctNum/totalNum*100)}%</div>`:`<div class="exam-pct" style="color:var(--text-sub)">未录各模块题数，这套卷暂不计入正确率统计，点「编辑」补录</div>`}
     ${r.percentile!=null?`<div class="exam-pct">击败 ${(r.percentile*100).toFixed(1)}% 考生</div>`:''}
     ${r.duration!=null?`<div class="exam-pct">用时 ${r.duration} 分钟</div>`:''}
     ${chips?`<div class="exam-chips">${chips}</div>`:''}
@@ -9663,7 +10164,7 @@ function buildExamRecordItem(r){
 /* 套卷记录列表（只套卷，不带每日刷题）——套卷 tab 专用 */
 function renderExamOnlyCard(){
   const card=el('div','card');
-  const records=Array.isArray(state.examRecords)?state.examRecords.slice().sort((a,b)=>(a.date<b.date?1:-1)):[];
+  const records=Array.isArray(state.examRecords)?state.examRecords.filter(r=>r&&typeof r==='object').sort((a,b)=>(a.date<b.date?1:-1)):[];
   card.innerHTML=`<div class="section-title"><span class="dot"></span>套卷记录（${records.length} 套）
     <button class="btn btn-sm" id="addExamBtn" style="margin-left:auto;">+ 套卷</button></div>`;
   const list=el('div','exam-list');
@@ -9680,26 +10181,26 @@ function renderExamOnlyCard(){
 /* 套卷速览 + 套卷成绩趋势——套卷 tab 顶部 */
 function renderExamOverviewCard(model){
   const card=el('div','card');
-  const records=Array.isArray(state.examRecords)?state.examRecords.slice():[];
-  const scores=records.map(r=>r.score).filter(v=>v!=null&&v!=='');
+  const records=Array.isArray(state.examRecords)?state.examRecords.filter(r=>r&&typeof r==='object').slice():[];
+  const scores=records.map(r=>numOr(r.score,null)).filter(v=>v!=null);
   const avg=scores.length?Math.round(scores.reduce((a,b)=>a+ (+b),0)/scores.length*10)/10:null;
   const byDate=records.slice().sort((a,b)=>(a.date<b.date?1:-1));
   /* 最近一套只取有分数的记录：否则最新那条没填分数时，卡片会显示空白而不是上一套的有效分 */
-  const _latestRec=byDate.find(r=>r.score!=null&&r.score!=='')||byDate[0];
+  const _latestRec=byDate.find(r=>numOr(r.score,null)!=null)||byDate[0];
   const latest=_latestRec?_latestRec.score:null;
   const latestDate=_latestRec?_latestRec.date:'';
   /* 套卷速度 = 有用时记录的总用时 ÷ 这些卷子的总题数（分/题）。
      注意 totQ 必须只累加 durRecs（填了用时的卷子），否则没填用时的卷子题量混进分母，
      3 套卷只 1 套填用时时速度被稀释 3 倍 */
-  const durRecs=records.filter(r=>r.duration&&r.duration>0);
-  const totalDur=durRecs.reduce((a,r)=>a+r.duration,0);
+  const durRecs=records.filter(r=>numOr(r.duration,0)>0);
+  const totalDur=durRecs.reduce((a,r)=>a+numOr(r.duration,0),0);
   const avgDur=durRecs.length?Math.round(totalDur/durRecs.length*10)/10:null;
-  let totQ=0; durRecs.forEach(r=>{EXAM_TYPES.forEach(t=>{const m=(r.moduleStats||{})[t.key];if(m&&m.total>0)totQ+=m.total;});});
+  let totQ=0; durRecs.forEach(r=>{EXAM_TYPES.forEach(t=>{const m=(r.moduleStats||{})[t.key];const mt=m?numOr(m.total,0):0;if(mt>0)totQ+=mt;});});
   const avgSpeed=(totalDur>0&&totQ>0)?Math.round(totalDur/totQ*100)/100:null;
   const ov=model.overall;
   const examRate=ov.exam.t>0?Math.round(ov.exam.c/ov.exam.t*100)+'%':'—';
-  const dailyRate=ov.daily.t>0?Math.round(ov.daily.c/ov.daily.t*100)+'%':'—';
-  const gap=(ov.exam.t>0&&ov.daily.t>0)?Math.round(ov.exam.c/ov.exam.t*100-ov.daily.c/ov.daily.t*100):null;
+  const dailyRate=(ov.daily.wc||0)>0?Math.round(ov.daily.c/ov.daily.wc*100)+'%':'—';
+  const gap=(ov.exam.t>0&&(ov.daily.wc||0)>0)?Math.round(ov.exam.c/ov.exam.t*100-ov.daily.c/ov.daily.wc*100):null;
   card.innerHTML=`<div class="section-title"><span class="dot"></span>套卷速览</div>
     <div class="blend-row">
       <div class="blend-cell"><div class="blend-num">${records.length}</div><div class="blend-lbl">总套数</div></div>
@@ -9716,10 +10217,10 @@ function renderExamOverviewCard(model){
 /* 套卷成绩趋势卡（独立卡片） */
 function renderExamTrendCard(){
   const card=el('div','card');
-  const records=Array.isArray(state.examRecords)?state.examRecords.slice():[];
+  const records=Array.isArray(state.examRecords)?state.examRecords.filter(r=>r&&typeof r==='object').slice():[];
   card.innerHTML=`<div class="section-title"><span class="dot"></span>套卷成绩趋势</div>`;
   const asc=records.slice().sort((a,b)=>a.date<b.date?-1:1);
-  const scored=asc.filter(r=>r.score!=null&&r.score!=='');
+  const scored=asc.filter(r=>numOr(r.score,null)!=null);
   if(scored.length<2){
     const tip=el('div','empty-tip');
     tip.style.padding='16px 0';
@@ -9728,7 +10229,7 @@ function renderExamTrendCard(){
   }else{
     const win=scored.slice(-8);
     const labels=win.map(r=>r.date.slice(5).replace('-','/'));
-    const series=[{data:win.map(r=>+r.score),color:'#e8a33d',label:'套卷'}];
+    const series=[{data:win.map(r=>numOr(r.score,null)),color:'#e8a33d',label:'套卷'}];
     const chart=el('div');
     chart.innerHTML=`<div class="muted" style="font-size:12px;margin-bottom:4px;">最近 ${win.length} 套</div>${drawLineChart(series,labels,'分')}`;
     card.appendChild(chart);
@@ -9743,7 +10244,8 @@ function renderExamLogCard(model){
   const allRecords=[];
   // 套卷记录
   (state.examRecords||[]).forEach(r=>{
-    allRecords.push({type:'exam',date:r.date,data:r});
+    if(!r||typeof r!=='object')return;
+    allRecords.push({type:'exam',date:r.date||'',data:r});
   });
   // 每日刷题记录
   const ds=state.dailyStats||{};
@@ -9758,7 +10260,7 @@ function renderExamLogCard(model){
   allRecords.sort((a,b)=>a.date<b.date?1:-1);
   const list=el('div','exam-list');
   const FOLD=5;
-  let expanded=false;
+  let expanded=_examLogExpanded;
   function renderList(){
     list.innerHTML='';
     if(allRecords.length===0){
@@ -9776,9 +10278,9 @@ function renderExamLogCard(model){
         const chips=[];let totalCount=0,totalMin=0;
         Object.keys(day).forEach(sec=>{
           const s=day[sec]||{};const tn=SECTION_TO_EXAMTYPE[sec];if(!tn)return;
-          const cnt=s.count||0;if(cnt<=0)return;
-          const rate=s.rate!=null?Math.round(s.rate)+'%':'—';
-          totalCount+=cnt;totalMin+=(s.minutes||0);
+          const cnt=numOr(s.count,0);if(cnt<=0)return;
+          const rate=s.rate!=null?Math.round(numOr(s.rate,0))+'%':'—';
+          totalCount+=cnt;totalMin+=numOr(s.minutes,0);
           chips.push(`<span class="exam-chip" style="--c:${typeColor(tn)}">${tn} ${cnt}题·${rate}</span>`);
         });
         item.innerHTML=`
@@ -9797,7 +10299,7 @@ function renderExamLogCard(model){
       const btn=el('button','btn btn-ghost btn-sm');
       btn.style.cssText='width:100%;margin-top:8px;';
       btn.textContent=expanded?`收起（只看最近 ${FOLD} 条）`:`展开全部（共 ${allRecords.length} 条）`;
-      btn.addEventListener('click',()=>{expanded=!expanded;renderList();});
+      btn.addEventListener('click',()=>{expanded=_examLogExpanded=!expanded;renderList();});
       list.appendChild(btn);
     }
   }
@@ -9811,6 +10313,9 @@ function openDailyRecordEditor(date){
   const rows=[];
   Object.keys(day).forEach(sec=>{
     const s=day[sec]||{};
+    /* 老数据 / 导入备份只有 count+rate、没有逐条 records：列表里给了「改」却点不出内容。
+       按现存汇总反推一条可编辑记录，之后照常重算，不丢原有成绩。 */
+    if(s&&!Array.isArray(s.records)&&typeof seedRecordsIfLegacy==='function'){seedRecordsIfLegacy(s,date+'|'+sec);save(true);}
     (s.records||[]).forEach((r,idx)=>rows.push({sec,idx,r}));
   });
   if(!rows.length){toast('该日没有可编辑的单条记录');return;}
@@ -9840,13 +10345,23 @@ function openDailyRecordEditor(date){
     const i=+b.dataset.eri;const row=rows[i];const wrap=box.querySelector('.dr-item[data-eri="'+i+'"]');
     const cnt=Math.max(0,parseInt(wrap.querySelector('.dr-count').value,10)||0);
     const rateRaw=wrap.querySelector('.dr-rate').value.trim();
-    let rate=null;if(rateRaw!==''){const pr=parseRateInput(rateRaw);rate=pr.valid?pr.rate:null;}
+    let rate=null;
+    if(rateRaw!==''){
+      const pr=parseRateInput(rateRaw);
+      if(!pr.valid){toast('正确率格式不对：请输入 70 或 14/20');return;}
+      rate=pr.rate;
+    }
     const mn=Math.max(0,parseInt(wrap.querySelector('.dr-min').value,10)||0);
     const rec=state.dailyStats[date]&&state.dailyStats[date][row.sec];
     if(!rec||!rec.records[row.idx])return;
+    const _oldMin=rec.records[row.idx].min||0;
     rec.records[row.idx].count=cnt;
     rec.records[row.idx].rate=rate;
     rec.records[row.idx].min=mn;
+    rec.records[row.idx].ets=Date.now();   // 编辑时间（跨设备合并认同一条）
+    // 改时长要同步当日模块总时长，否则「用时」不会变
+    const _dm=mn-_oldMin;
+    if(_dm){rec.minutes=Math.max(0,(rec.minutes||0)+_dm);if(rec.minutes<=0)delete rec.minutes;}
     recomputeDailyStat(row.sec,date);
     save();render();
     toast('已保存');
@@ -9856,7 +10371,11 @@ function openDailyRecordEditor(date){
     const i=+b.dataset.eri;const row=rows[i];
     uiConfirm('删除这条刷题记录？',()=>{
       const rec=state.dailyStats[date]&&state.dailyStats[date][row.sec];
+      const _rm=rec&&rec.records?rec.records[row.idx]:null;
       if(rec&&rec.records)rec.records.splice(row.idx,1);
+      const _dk=recDelKey(_rm);if(_dk)markEntityDeleted('brec',[_dk]);   // 跨端删除标记，防止对端同步时复活
+      // 删记录同步扣掉这条的时长
+      if(_rm&&_rm.min>0&&rec){rec.minutes=Math.max(0,(rec.minutes||0)-_rm.min);if(rec.minutes<=0)delete rec.minutes;}
       recomputeDailyStat(row.sec,date);
       if(rec&&!rec.records.length)delete state.dailyStats[date][row.sec];
       if(Object.keys(state.dailyStats[date]||{}).length===0)delete state.dailyStats[date];
@@ -9904,9 +10423,11 @@ function parseFenbiReport(text){
         const cc=after.match(cntRe)||before.match(cntRe);
         const total=cc?+cc[1]:0;
         const correct=total>0?Math.round(total*pct/100):0;
-        if(!hits[m.key])hits[m.key]={total:0,correct:0};
+        if(!hits[m.key])hits[m.key]={total:0,correct:0,pct:null};
         hits[m.key].total+=total;
         hits[m.key].correct+=correct;
+        /* 报告只给正确率、没给题数时也保留百分比，不再把该模块错误地算成 0% */
+        if(total===0)hits[m.key].pct=pct;
         spans.push([idx,e]);break;
       }
       idx=ns.indexOf(m.label,idx+1);
@@ -9915,7 +10436,7 @@ function parseFenbiReport(text){
   Object.keys(hits).forEach(k=>{
     const h=hits[k];
     if(h.total>0)res.counts[k]=h.total;
-    res.rates[k]=h.total>0?h.correct/h.total:(h.correct>0?1:0);
+    res.rates[k]=h.total>0?h.correct/h.total:(h.pct!=null?h.pct/100:0);
   });
   return res;
 }
@@ -9944,22 +10465,44 @@ function syncTaojuanDaily(date){
     if(old&&!(old.records&&old.records.length)){delete state.dailyStats[date].taojuan;}
     return;
   }
+  /* 旧版/导入数据可能已有手填 records：重建套卷派生值时必须保留，
+     并把其套数、正确率题量与用时并入，不能再以 records:[] 一把清空。 */
+  const manual=old&&Array.isArray(old.records)?old.records:[];
+  let manualCount=0,manualWeighted=0,manualWc=0,manualMin=0;
+  manual.forEach(r=>{
+    const c=numOr(r&&r.count,0);
+    manualCount+=c;
+    manualMin+=numOr(r&&r.min,0);
+    const rt=(r&&r.rate)!=null?numOr(r.rate,null):null;
+    if(c>0&&rt!=null){manualWeighted+=c*rt;manualWc+=c;}
+  });
   let tot=0,cor=0,minSum=0;const subs={};
   recs.forEach(rc=>{
-    minSum+=(rc.duration||0);
+    if(!rc)return;
+    minSum+=numOr(rc.duration,0);
     EXAM_TYPES.forEach(t=>{
       const m=rc.moduleStats&&rc.moduleStats[t.key];
-      if(m&&m.total>0){
-        tot+=m.total;cor+=(m.correct||0);
+      const mt=m?numOr(m.total,0):0;
+      if(mt>0){
+        const mc=numOr(m.correct,0);
+        tot+=mt;cor+=mc;
         /* subs key 用大类中文名：日历详情 subName 查不到时直接兜底显示该字符串 */
         if(!subs[t.name])subs[t.name]={count:0,correct:0};
-        subs[t.name].count+=m.total;subs[t.name].correct+=(m.correct||0);
+        subs[t.name].count+=mt;subs[t.name].correct+=mc;
       }
     });
   });
   Object.keys(subs).forEach(k=>{const s=subs[k];s.rate=s.count>0?Math.round(s.correct/s.count*100):0;});
-  const stat={count:recs.length,rate:tot>0?Math.round(cor/tot*100):0,subs,records:[]};
-  if(minSum>0)stat.minutes=Math.round(minSum*10)/10;
+  const allMin=minSum+manualMin;
+  const stat={
+    count:recs.length+manualCount,
+    /* 没录各模块题数时不写假的 0%：首页今日汇总 / 日历详情会显示「—」，
+       并提示去套卷编辑里补录，而不是让人以为这套卷全错 */
+    rate:(tot+manualWc)>0?Math.round((cor*100+manualWeighted)/(tot+manualWc)):null,
+    subs,
+    records:manual
+  };
+  if(allMin>0)stat.minutes=Math.round(allMin*10)/10;
   if(!state.dailyStats[date])state.dailyStats[date]={};
   state.dailyStats[date].taojuan=stat;
 }
@@ -10293,6 +10836,18 @@ function openExamEditor(id, todoId){
        编辑时改了日期，新旧两天都要重算，否则旧日期残留、新日期显示 0 */
     syncTaojuanDaily(date);
     if(_oldDate&&_oldDate!==date)syncTaojuanDaily(_oldDate);
+    /* 番茄钟停止时已写过一条 session；保存套卷时长后消费它，避免同一天重复计时。
+       session 始终记在番茄钟结束当天，不能随套卷日期被改到别的日期。 */
+    const _pd=todayStr();
+    if(pendingPomoSessId&&state.studyRecords[_pd]&&state.studyRecords[_pd].sessions){
+      const _si=state.studyRecords[_pd].sessions.findIndex(s=>s.id===pendingPomoSessId&&s.section==='taojuan');
+      if(_si>=0){
+        const _rm=state.studyRecords[_pd].sessions[_si];
+        markEntityDeleted('session',[_rm&&_rm.id]);
+        state.studyRecords[_pd].sessions.splice(_si,1);
+      }
+    }
+    pendingPomoSessId=null;
     // 关联任务：保存套卷成绩即标记该待办完成（取消则任务保持未做、仍在列表）
     if(todoId){
       const _td=(state.todos||[]).find(x=>x.id===todoId);
@@ -10378,12 +10933,15 @@ function openProfileEditor(){
 /* ============================================================
    弹层与工具
    ============================================================ */
+var _modalCloseHook=null;
+function setModalCloseHook(fn){_modalCloseHook=(typeof fn==='function')?fn:null;}
 function openModal(title,bodyHtml,cls){
+  if(_modalCloseHook)_modalCloseHook=null;   // 直接换弹窗（没走 closeModal）时清掉排队回调，避免下次关弹窗误触发
   const m=$('#modal'); m.className='modal'+(cls?' '+cls:'');
   $('#modalTitle').textContent=title;$('#modalBody').innerHTML=bodyHtml;
   $('#mask').classList.add('show');m.classList.add('show');
 }
-function closeModal(){var _m=$('#mask');if(_m)_m.classList.remove('show');var _md=$('#modal');if(_md)_md.classList.remove('show');if(_rollTimer){clearTimeout(_rollTimer);_rollTimer=null;}}
+function closeModal(){var _m=$('#mask');if(_m)_m.classList.remove('show');var _md=$('#modal');if(_md)_md.classList.remove('show');if(_rollTimer){clearTimeout(_rollTimer);_rollTimer=null;}var _h=_modalCloseHook;_modalCloseHook=null;if(_h){try{_h();}catch(e){}}if(typeof scheduleBrushAsk==='function')scheduleBrushAsk();}
 $('#modalClose').addEventListener('click',closeModal);
 $('#mask').addEventListener('click',closeModal);
 window.closeModal=closeModal;
