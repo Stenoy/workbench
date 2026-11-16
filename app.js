@@ -19,6 +19,10 @@ const AUTO_PUSH_DEBOUNCE=2*60*1000;
 const AUTO_PULL_INTERVAL=30*1000;
 /* 数据页「刷题记录」展开全部状态：render() 重建整个面板时不能丢（放文件顶部防 TDZ） */
 let _examLogExpanded=false;
+/* 套卷成绩明细表「显示全部 / 最近 10 套」开关，放文件顶部防 TDZ */
+let _examMatrixAll=false;
+/* 手机端竖向明细卡片展开到第几套：render() 重建面板时不能自己收起（防 TDZ） */
+let _mxvOpen={};
 /* 数据页「薄弱考点」里展开的子模块：裸 render()（编辑成绩/存删套卷/云同步）也要能恢复 */
 let _autoExpanded=[];
 
@@ -6591,10 +6595,12 @@ function renderReview(c){
   // --- 行测复盘：题型看板 + 薄弱分析 + 下一步建议 ---
   gType.appendChild(renderTypeWeakCard(model));
 
-  // --- 套卷：套卷速览 + 成绩趋势 + 套卷记录（只套卷，不掺每日刷题）---
+  // --- 套卷：套卷速览 + 成绩明细表(横表/竖卡互斥) + 题型总览 + 成绩趋势；改删并入明细表，不再单列套卷记录 ---
   gExam.appendChild(renderExamOverviewCard(model));
+  gExam.appendChild(renderExamMatrixCard());
+  gExam.appendChild(renderExamVerticalCard());
+  gExam.appendChild(renderExamTypeSummaryCard());
   gExam.appendChild(renderExamTrendCard());
-  gExam.appendChild(renderExamOnlyCard());
 
 
   // ===== 月度打卡日历（点某天看当天详情）=====
@@ -10161,20 +10167,253 @@ function buildExamRecordItem(r){
   return item;
 }
 
-/* 套卷记录列表（只套卷，不带每日刷题）——套卷 tab 专用 */
-function renderExamOnlyCard(){
-  const card=el('div','card');
-  const records=Array.isArray(state.examRecords)?state.examRecords.filter(r=>r&&typeof r==='object').sort((a,b)=>(a.date<b.date?1:-1)):[];
-  card.innerHTML=`<div class="section-title"><span class="dot"></span>套卷记录（${records.length} 套）
-    <button class="btn btn-sm" id="addExamBtn" style="margin-left:auto;">+ 套卷</button></div>`;
-  const list=el('div','exam-list');
-  if(!records.length){
-    list.innerHTML=`<div class="empty-tip">还没有套卷记录<br>点右上角「+ 套卷」录入第一次模考/真题成绩</div>`;
-  }else{
-    records.forEach(r=>list.appendChild(buildExamRecordItem(r)));
+/* ============ 套卷成绩明细表：题型 × 每套卷（仿成绩追踪表） ============
+   左侧固定：分组 / 题型 / 练习次数 / 差距 / 目标 / 平均正确率；
+   右侧按套卷日期展开每套该题型正确率，末行是该套总分。
+   只取 examRecords；坏记录、脏日期、字符串数字都兜住，出错也不拖垮整页。 */
+function examMatrixCell(r,tKey,subKey){
+  if(!r||typeof r!=='object')return null;
+  const ms=r.moduleStats||{},m=ms[tKey];
+  if(subKey){
+    const sv=m&&m.subs&&m.subs[subKey];
+    if(sv&&numOr(sv.total,0)>0){const tt=numOr(sv.total,0);return {rate:numOr(sv.correct,0)/tt*100,t:tt,c:numOr(sv.correct,0)};}
+    const v=r.rates&&r.rates[subKey];
+    if(typeof v==='number'&&isFinite(v))return {rate:v<=1?v*100:v,t:0,c:0};
+    return null;
   }
-  card.appendChild(list);
-  card.querySelector('#addExamBtn').addEventListener('click',()=>openExamEditor());
+  if(m&&numOr(m.total,0)>0){const tt=numOr(m.total,0);return {rate:numOr(m.correct,0)/tt*100,t:tt,c:numOr(m.correct,0)};}
+  const v=r.rates&&r.rates[tKey];
+  if(typeof v==='number'&&isFinite(v))return {rate:v<=1?v*100:v,t:0,c:0};
+  /* 老数据只存了子模块率：按子模块题量加权兜出大类率 */
+  if(m&&m.subs){
+    let st=0,sc=0;
+    Object.keys(m.subs).forEach(function(k){const sv=m.subs[k];if(!sv)return;const q=numOr(sv.total,0);if(q>0){st+=q;sc+=numOr(sv.correct,0);}});
+    if(st>0)return {rate:sc/st*100,t:st,c:sc};
+  }
+  const t=EXAM_TYPES.find(x=>x.key===tKey);
+  if(t&&t.subs){
+    let sum=0,n=0;
+    t.subs.forEach(function(s){const v=r.rates&&r.rates[s.key];if(typeof v==='number'&&isFinite(v)){sum+=(v<=1?v*100:v);n++;}});
+    if(n)return {rate:sum/n,t:0,c:0};
+  }
+  return null;
+}
+function matrixModel(){
+  const all=(Array.isArray(state.examRecords)?state.examRecords:[])
+    .filter(function(r){return r&&typeof r==='object'&&typeof r.date==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(r.date);})
+    .slice().sort(function(a,b){return a.date<b.date?-1:(a.date>b.date?1:0);});
+  const GROUP_SHORT={'言语':'言语','判断推理':'判断','数量关系':'数量','政治常识':'常识','资料分析':'资料'};
+  const getTgt=function(k){return (state.weakTargets&&state.weakTargets[k]!=null)?numOr(state.weakTargets[k],null):null;};
+  function rowStats(row){
+    let n=0,num=0,den=0;
+    all.forEach(function(r){const v=examMatrixCell(r,row.tKey,row.subKey);if(!v)return;n++;
+      if(v.t>0){num+=v.c;den+=v.t;}else{num+=v.rate/100;den+=1;}});
+    return {n:n,avg:den>0?num/den*100:null};
+  }
+  const groups=EXAM_TYPES.map(function(t){
+    /* 数量关系只看大类，不展开子分类（其余题型照旧） */
+    const noSubs=(t.key==='数量关系'||t.goalNoSubs===true);
+    const subs=noSubs?[]:(t.subs||[]).filter(function(s){return all.some(function(r){return !!examMatrixCell(r,t.key,s.key);});});
+    const rows=[{tKey:t.key,subKey:null,label:subs.length?'整类':t.name,targetKey:ET_TO_SEC[t.key]||t.key,main:true}];
+    subs.forEach(function(s){rows.push({tKey:t.key,subKey:s.key,label:s.name,targetKey:s.key,main:false});});
+    return {name:GROUP_SHORT[t.key]||t.name.slice(0,2),rows:rows};
+  });
+  return {all:all,groups:groups,getTgt:getTgt,rowStats:rowStats};
+}
+/* 明细表里的删除入口：横表操作行 / 竖卡按钮共用，删完按 examRecords 重建当天套卷打卡 */
+function delExamRecord(id){
+  const hit=(state.examRecords||[]).find(function(x){return String(x.id)===String(id);});
+  if(!hit)return;
+  uiConfirm('删除这条套卷记录？',function(){
+    markEntityDeleted('examRecord',[hit.id]);
+    state.examRecords=(state.examRecords||[]).filter(function(x){return String(x.id)!==String(hit.id);});
+    syncTaojuanDaily(hit.date);save();render();toast('已删除');
+  },{danger:true});
+}
+/* 明细表公共：标题栏（+ 套卷 + 展开按钮） */
+function mxTitle(all,lim,allOpen){
+  return '<div class="section-title"><span class="dot"></span>套卷成绩明细表'
+    +'<button class="btn btn-sm mx-add-exam" style="margin-left:8px;">+ 套卷</button>'
+    +(all.length>lim?'<button class="btn btn-sm" id="'+(allOpen?'mxToggle':'mxvToggle')+'" style="margin-left:auto;min-height:44px;">'+(_examMatrixAll?'只看最近 '+lim+' 套':'显示全部 '+all.length+' 套')+'</button>':'')
+    +'</div>';
+}
+/* 平板 / 宽屏：题型 × 每套卷 横表（含改删操作行） */
+function renderExamMatrixCard(){
+  const card=el('div','card mx-desktop-only');
+  try{
+    const M=matrixModel(),all=M.all,groups=M.groups,getTgt=M.getTgt,rowStats=M.rowStats;
+    const lim=10;
+    const title=mxTitle(all,lim,true);
+    function paint(){
+      const oldWrap=card.querySelector('.mx-wrap');
+      const keep=oldWrap?oldWrap.scrollLeft:0;
+      if(!all.length){card.innerHTML=title+'<div class="empty-tip">还没有套卷记录<br>录入成绩后这里会自动生成「题型 × 每套卷」明细表</div>';bind();return;}
+      const showAll=_examMatrixAll||all.length<=lim;
+      const win=showAll?all:all.slice(-lim);
+      const dayCount={};win.forEach(function(r){dayCount[r.date]=(dayCount[r.date]||0)+1;});
+      const seen={},marks=['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
+      const heads=win.map(function(r){
+        const p=r.date.split('-');seen[r.date]=(seen[r.date]||0)+1;
+        const mk=dayCount[r.date]>1?(marks[seen[r.date]-1]||('('+seen[r.date]+')')):'';
+        return {r:r,label:(+p[1])+'.'+(+p[2])+mk};
+      });
+      let body='';
+      groups.forEach(function(g){
+        g.rows.forEach(function(row,i){
+          const st=rowStats(row),tgt=getTgt(row.targetKey),avg=st.avg;
+          const gap=(tgt!=null&&avg!=null)?tgt-avg:null;
+          const gapTxt=gap==null?'—':(Math.round(gap*10)/10).toFixed(1)+'%';
+          const gapCls=gap==null?'':(gap>0?' mx-gap mx-bad':' mx-good');
+          const cells=heads.map(function(h){
+            const v=examMatrixCell(h.r,row.tKey,row.subKey);
+            if(!v)return '<td class="mx-cell"></td>';
+            const p=Math.round(Math.max(0,Math.min(100,v.rate)));
+            const low=(tgt!=null&&p<tgt)?' mx-low':'';
+            return '<td class="mx-cell'+low+'">'+p+'%</td>';
+          }).join('');
+          body+='<tr class="'+(row.main?'mx-main':'mx-sub')+'">'
+            +(i===0?'<td class="mx-sticky mx-group" rowspan="'+g.rows.length+'">'+g.name+'</td>':'')
+            +'<td class="mx-sticky mx-name">'+escapeHtml(row.label)+'</td>'
+            +'<td class="mx-cell">'+(st.n||'—')+'</td>'
+            +'<td class="mx-cell'+gapCls+'">'+gapTxt+'</td>'
+            +'<td class="mx-cell mx-target"><span class="mx-target-val" data-key="'+escapeHtml(row.targetKey)+'">'+(tgt!=null?Math.round(tgt)+'%':'—')+'</span></td>'
+            +'<td class="mx-cell mx-avg">'+(avg!=null?Math.round(avg)+'%':'—')+'</td>'
+            +cells+'</tr>';
+        });
+      });
+      body+='<tr class="mx-total"><td class="mx-sticky mx-total-label" colspan="2">总分</td>'
+        +'<td class="mx-cell"></td><td class="mx-cell"></td><td class="mx-cell"></td><td class="mx-cell"></td>'
+        +heads.map(function(h){const s=numOr(h.r.score,null);return '<td class="mx-cell">'+(s!=null?Math.round(s*10)/10:'—')+'</td>';}).join('')+'</tr>';
+      body+='<tr class="mx-ops"><td class="mx-sticky mx-ops-label" colspan="2">操作</td>'
+        +'<td class="mx-cell"></td><td class="mx-cell"></td><td class="mx-cell"></td><td class="mx-cell"></td>'
+        +heads.map(function(h){const id=escapeHtml(String(h.r.id||''));return '<td class="mx-cell"><button class="mx-op-btn mx-op-edit" data-exam="'+id+'">改</button><button class="mx-op-btn mx-op-del" data-del="'+id+'">删</button></td>';}).join('')+'</tr>';
+      const head='<thead><tr><th class="mx-sticky mx-group">类</th><th class="mx-sticky mx-name">题型</th>'
+        +'<th>练习次数</th><th>差距</th><th>目标</th><th>平均正确率</th>'
+        +heads.map(function(h){return '<th class="mx-head-date" data-exam="'+escapeHtml(String(h.r.id||''))+'">'+h.label+'</th>';}).join('')+'</tr></thead>';
+      card.innerHTML=title
+        +'<div class="mx-tip">左右滑动看每套卷 · 点表头分数或「改」编辑 · 点「删」删除 · 点目标可改 · <span style="color:#d9534f">红字</span>=低于目标；'
+        +'次数/平均按全部 '+all.length+' 套算'+(showAll?'':'，右侧只列最近 '+win.length+' 套')+'</div>'
+        +'<div class="mx-wrap"><table class="mx-table">'+head+'<tbody>'+body+'</tbody></table></div>';
+      const wrap=card.querySelector('.mx-wrap');if(wrap)wrap.scrollLeft=keep;
+      bind();
+    }
+    function onEdit(id){if(id&&(state.examRecords||[]).some(function(x){return String(x.id)===id;}))openExamEditor(id);}
+    function bind(){
+      const add=card.querySelector('.mx-add-exam');
+      if(add)add.addEventListener('click',function(){openExamEditor();});
+      const tg=card.querySelector('#mxToggle');
+      if(tg)tg.addEventListener('click',function(){_examMatrixAll=!_examMatrixAll;paint();});
+      card.querySelectorAll('.mx-target-val').forEach(function(sp){sp.addEventListener('click',function(){openTargetModal(sp.dataset.key);});});
+      card.querySelectorAll('.mx-head-date[data-exam],.mx-op-edit[data-exam]').forEach(function(b){
+        b.addEventListener('click',function(){onEdit(b.dataset.exam);});
+      });
+      card.querySelectorAll('.mx-op-del[data-del]').forEach(function(b){
+        b.addEventListener('click',function(){delExamRecord(b.dataset.del);});
+      });
+    }
+    paint();
+  }catch(e){
+    console.error('renderExamMatrixCard error:',e);
+    card.innerHTML='<div class="section-title"><span class="dot"></span>套卷成绩明细表</div><div class="empty-tip">明细表加载出错，其它数据不受影响</div>';
+  }
+  return card;
+}
+/* 手机：一套卷一张竖卡（独立卡片），点开看各题型，改删都在卡内 */
+function renderExamVerticalCard(){
+  const card=el('div','card mx-mobile-only');
+  try{
+    const M=matrixModel(),all=M.all,groups=M.groups,getTgt=M.getTgt,rowStats=M.rowStats;
+    const lim=5;
+    const title=mxTitle(all,lim,false);
+    function paint(){
+      if(!all.length){card.innerHTML=title+'<div class="empty-tip">还没有套卷记录<br>点右上角「+ 套卷」录入第一次模考/真题成绩</div>';bind();return;}
+      const showAll=_examMatrixAll||all.length<=lim;
+      const win=showAll?all:all.slice(-lim);
+      const dayCount={};win.forEach(function(r){dayCount[r.date]=(dayCount[r.date]||0)+1;});
+      const seen={},marks=['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
+      const heads=win.map(function(r){
+        const p=r.date.split('-');seen[r.date]=(seen[r.date]||0)+1;
+        const mk=dayCount[r.date]>1?(marks[seen[r.date]-1]||('('+seen[r.date]+')')):'';
+        return {r:r,label:(+p[1])+'.'+(+p[2])+mk};
+      });
+      const items=win.map(function(r,i){return {r:r,h:heads[i]};}).reverse();
+      const latest=items.length?String(items[0].r.id||''):'';
+      if(!Object.keys(_mxvOpen).length&&latest)_mxvOpen[latest]=true;
+      let html='<div class="mxv-list">';
+      items.forEach(function(it){
+        const r=it.r,h=it.h,id=String(r.id||h.label),isOpen=!!_mxvOpen[id];
+        const score=numOr(r.score,null);
+        html+='<div class="mxv-item'+(isOpen?' open':'')+'" data-id="'+escapeHtml(id)+'">'
+          +'<div class="mxv-head">'
+            +'<span class="mxv-date">'+h.label+'</span>'
+            +'<span class="mxv-title">'+escapeHtml(r.name||'套卷')+'</span>'
+            +'<span class="mxv-score">'+(score!=null?Math.round(score*10)/10:'—')+'<small> 分</small></span>'
+            +'<span class="mxv-arrow">&#8964;</span>'
+          +'</div><div class="mxv-body">';
+        if(isOpen){
+          html+='<div class="mxv-ops"><button class="btn btn-sm mxv-edit" data-exam="'+escapeHtml(String(r.id||''))+'">改这套卷</button>'
+            +'<button class="btn btn-sm mxv-del" data-del="'+escapeHtml(String(r.id||''))+'" style="color:var(--danger)">删这套卷</button></div>';
+          groups.forEach(function(g){
+            let inner='';
+            g.rows.forEach(function(row){
+              const v=examMatrixCell(r,row.tKey,row.subKey);if(!v)return;
+              const p=Math.round(Math.max(0,Math.min(100,v.rate)));
+              const tgt=getTgt(row.targetKey),st=rowStats(row),avg=st.avg;
+              const gap=(tgt!=null&&avg!=null)?tgt-avg:null;
+              const low=(tgt!=null&&p<tgt)?' mxv-low':'';
+              const gapChip=gap==null?'':'<span class="mxv-chip'+(gap>0?' mxv-gap-bad':'')+'">差 '+(gap>0?'+':'')+(Math.round(gap*10)/10).toFixed(1)+'%</span>';
+              inner+='<div class="mxv-row'+(row.main?' mxv-main':'')+'">'
+                +'<span class="mxv-name">'+escapeHtml(row.label)+'</span>'
+                +'<span class="mxv-rate'+low+'">'+p+'%</span>'
+                +'<span class="mxv-meta">'
+                  +'<span class="mxv-target-val" data-key="'+escapeHtml(row.targetKey)+'">目标 '+(tgt!=null?Math.round(tgt)+'%':'—')+'</span>'
+                  +'<span>均 '+(avg!=null?Math.round(avg)+'%':'—')+'</span>'
+                  +'<span>'+st.n+' 次</span>'+gapChip
+                +'</span></div>';
+            });
+            if(inner)html+='<div class="mxv-group">'+g.name+'</div>'+inner;
+          });
+        }
+        html+='</div></div>';
+      });
+      html+='</div>';
+      card.innerHTML=title
+        +'<div class="mx-tip">一套卷一张卡，点卡片展开看各题型 · <span style="color:#d9534f">红字</span>=低于目标 · '
+        +'<span style="color:#2f8f5b">绿底</span>=平均没达到目标 · 目标可点改</div>'+html;
+      bind();
+    }
+    function bind(){
+      const add=card.querySelector('.mx-add-exam');
+      if(add)add.addEventListener('click',function(){openExamEditor();});
+      const tg=card.querySelector('#mxvToggle');
+      if(tg)tg.addEventListener('click',function(){_examMatrixAll=!_examMatrixAll;paint();});
+      card.querySelectorAll('.mxv-head').forEach(function(hd){
+        hd.addEventListener('click',function(){
+          const item=hd.closest('.mxv-item'),id=item&&item.dataset.id;
+          if(!id)return;
+          if(_mxvOpen[id])delete _mxvOpen[id];else _mxvOpen[id]=true;
+          paint();
+        });
+      });
+      card.querySelectorAll('.mxv-edit[data-exam]').forEach(function(b){
+        b.addEventListener('click',function(ev){
+          ev.stopPropagation();
+          const id=b.dataset.exam;
+          if(id&&(state.examRecords||[]).some(function(x){return String(x.id)===id;}))openExamEditor(id);
+        });
+      });
+      card.querySelectorAll('.mxv-del[data-del]').forEach(function(b){
+        b.addEventListener('click',function(ev){ev.stopPropagation();delExamRecord(b.dataset.del);});
+      });
+      card.querySelectorAll('.mxv-target-val').forEach(function(sp){
+        sp.addEventListener('click',function(ev){ev.stopPropagation();openTargetModal(sp.dataset.key);});
+      });
+    }
+    paint();
+  }catch(e){
+    console.error('renderExamVerticalCard error:',e);
+    card.innerHTML='<div class="section-title"><span class="dot"></span>套卷成绩明细表</div><div class="empty-tip">明细表加载出错，其它数据不受影响</div>';
+  }
   return card;
 }
 
@@ -10211,6 +10450,53 @@ function renderExamOverviewCard(model){
       <div class="blend-cell"><div class="blend-num">${avgDur!=null?avgDur:'—'}</div><div class="blend-lbl">平均每套用时(分)</div></div>
       <div class="blend-cell"><div class="blend-num" style="color:#e8a33d">${avgSpeed!=null?avgSpeed:'—'}</div><div class="blend-lbl">速度(分/题)</div></div>
     </div>`;
+  return card;
+}
+
+/* 题型总览卡（独立卡片）：按全部套卷汇总每个题型的平均正确率 vs 目标
+   差距口径 = 实际 - 目标：正数=超出目标（绿底绿字），负数=低于目标（红字） */
+function renderExamTypeSummaryCard(){
+  const card=el('div','card');
+  const M=matrixModel(),all=M.all,groups=M.groups,getTgt=M.getTgt,rowStats=M.rowStats;
+  const title='<div class="section-title"><span class="dot"></span>题型总览'
+    +(all.length?'<span class="muted" style="margin-left:auto;font-size:12px;font-weight:400;">共 '+all.length+' 套</span>':'')
+    +'</div>';
+  if(!all.length){
+    card.innerHTML=title+'<div class="empty-tip">还没有套卷记录<br>录入成绩后这里会自动汇总各题型正确率</div>';
+    return card;
+  }
+  let body='';
+  groups.forEach(function(g){
+    g.rows.forEach(function(row){
+      const st=rowStats(row),tgt=getTgt(row.targetKey),avg=st.avg;
+      const gap=(tgt!=null&&avg!=null)?avg-tgt:null;
+      let gapHtml='—',avgCls='';
+      if(gap!=null){
+        const gd=Math.round(gap*10)/10;
+        if(gd>0){gapHtml='<span class="xo-gap-good">+'+gd.toFixed(1)+'%</span>';}
+        else if(gd<0){gapHtml='<span class="xo-low">'+gd.toFixed(1)+'%</span>';avgCls=' xo-low';}
+        else{gapHtml='0.0%';}
+      }
+      const nameStyle=row.main?'font-weight:600;color:var(--primary-deep);':'padding-left:18px;color:var(--text-sub);';
+      /* 大类行用全名（「言语理解」），明细表里那套「整类」标签在没有「类」列时会看不懂 */
+      let label=row.label;
+      if(row.main&&row.subKey==null){const t=EXAM_TYPES.find(function(x){return x.key===row.tKey;});if(t)label=t.name;}
+      body+='<tr>'
+        +'<td style="'+nameStyle+'">'+escapeHtml(label)+'</td>'
+        +'<td>'+(st.n||'—')+'</td>'
+        +'<td class="'+avgCls.trim()+'">'+(avg!=null?Math.round(avg)+'%':'—')+'</td>'
+        +'<td><span class="xo-target-val" data-key="'+escapeHtml(row.targetKey)+'">'+(tgt!=null?Math.round(tgt)+'%':'—')+'</span></td>'
+        +'<td>'+gapHtml+'</td>'
+        +'</tr>';
+    });
+  });
+  card.innerHTML=title
+    +'<div class="mx-tip">按全部 '+all.length+' 套汇总 · 点「目标」可直接改 · <span style="color:#2f8f5b">绿底</span>=超目标，<span style="color:#d9534f">红字</span>=低于目标</div>'
+    +'<table class="xo-table"><thead><tr><th>题型</th><th>套数</th><th>平均正确率</th><th>目标</th><th>差距</th></tr></thead>'
+    +'<tbody>'+body+'</tbody></table>';
+  card.querySelectorAll('.xo-target-val').forEach(function(sp){
+    sp.addEventListener('click',function(){openTargetModal(sp.dataset.key);});
+  });
   return card;
 }
 

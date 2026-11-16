@@ -1983,3 +1983,88 @@ select:disabled{opacity:0.5;cursor:not-allowed;}
 .bk-ch{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-top:1px dashed var(--line,#eee);}
 .bk-ch-n{color:var(--text);font-weight:600;white-space:nowrap;}
 .bk-ch-v{color:var(--text-sub);text-align:right;}
+
+/* 套卷成绩明细表（题型 × 每套卷）：左两列冻结，右侧横向滑动 */
+.mx-tip{font-size:11.5px;color:var(--text-sub);line-height:1.5;margin:2px 0 8px;}
+.mx-wrap{overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;border:1px solid var(--border);border-radius:10px;max-width:100%;}
+.mx-table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:12px;}
+.mx-table th,.mx-table td{height:38px;padding:6px 5px;text-align:center;white-space:nowrap;border-right:1px solid #efedf5;border-bottom:1px solid #efedf5;box-sizing:border-box;}
+.mx-table th{background:#f4f2fa;color:var(--text-sub);font-weight:600;}
+.mx-table .mx-sticky{position:sticky;}
+.mx-table th.mx-sticky{z-index:5;}
+.mx-table td.mx-sticky{z-index:2;background:#fff;}
+.mx-table .mx-group{left:0;width:34px;min-width:34px;max-width:34px;background:#faf9fd;color:var(--text-sub);font-weight:600;}
+.mx-table .mx-name{left:34px;width:88px;min-width:88px;max-width:88px;text-align:left;padding-left:8px;}
+.mx-table th.mx-name{text-align:left;}
+.mx-table th:not(.mx-sticky),.mx-table td.mx-cell{min-width:46px;}
+.mx-table th.mx-head-date{cursor:pointer;color:var(--primary-deep);padding:6px 3px;}
+.mx-table td.mx-gap{background:#e9f7ef;}
+.mx-table td.mx-target{background:#fff0e4;}
+.mx-table td.mx-avg{background:#fff7cc;font-weight:600;}
+.mx-table .mx-low{color:#d9534f;font-weight:700;}
+.mx-table .mx-bad{color:#d96b6b;}
+.mx-table .mx-good{color:#2bb673;}
+.mx-table .mx-target-val{cursor:pointer;border-bottom:1px dashed var(--primary-deep);padding:4px 3px;min-height:36px;display:inline-flex;align-items:center;justify-content:center;}
+.mx-table tr.mx-total td{background:#f7f6fa;font-weight:700;border-top:2px solid #e4e0f0;}
+.mx-table tr.mx-total td.mx-sticky{background:#f7f6fa;}
+.mx-table td.mx-total-label{left:0;width:122px;min-width:122px;max-width:122px;text-align:left;padding-left:10px;}
+.mx-table tr.mx-main td.mx-name{font-weight:600;color:var(--primary-deep);}
+@media (max-width:400px){
+  .mx-table{font-size:11.5px;}
+  .mx-table th,.mx-table td{padding:6px 3px;}
+  .mx-table .mx-name{width:78px;min-width:78px;max-width:78px;}
+  .mx-table th:not(.mx-sticky),.mx-table td.mx-cell{min-width:42px;}
+  .mx-table td.mx-total-label{width:112px;min-width:112px;max-width:112px;}
+}
+
+/* ===== 套卷成绩明细表 · 手机/平板竖向卡片（一套卷一张，不横滑） ===== */
+.mxv-list{display:flex;flex-direction:column;gap:10px;}
+.mxv-item{border:1px solid var(--border);border-radius:12px;background:#fff;overflow:hidden;box-shadow:var(--shadow-sm);}
+.mxv-head{display:flex;align-items:center;gap:8px;min-height:52px;padding:10px 12px;background:#faf9fd;cursor:pointer;}
+.mxv-date{font-size:14px;font-weight:700;color:var(--primary-deep);min-width:58px;}
+.mxv-title{flex:1;min-width:0;font-size:12.5px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mxv-score{font-size:17px;font-weight:700;color:var(--text);white-space:nowrap;}
+.mxv-score small{font-size:11px;font-weight:400;color:var(--text-light);}
+.mxv-arrow{font-size:18px;color:var(--text-light);transition:transform .2s;line-height:1;}
+.mxv-item.open .mxv-arrow{transform:rotate(180deg);}
+.mxv-body{display:none;padding:0 12px 12px;}
+.mxv-item.open .mxv-body{display:block;}
+.mxv-edit{width:100%;min-height:44px;margin:10px 0 2px;}
+.mxv-group{font-size:11px;font-weight:600;color:var(--text-sub);background:#f4f2fa;border-radius:6px;padding:4px 8px;margin:10px 0 2px;}
+.mxv-row{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px;padding:8px 2px;border-bottom:1px solid #f2f0f7;}
+.mxv-row .mxv-name{flex:1;min-width:96px;font-size:13px;}
+.mxv-row.mxv-main .mxv-name{font-weight:600;color:var(--primary-deep);}
+.mxv-rate{font-size:16px;font-weight:700;min-width:50px;text-align:right;}
+.mxv-low{color:#d9534f;}
+.mxv-meta{flex-basis:100%;display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:10.5px;color:var(--text-sub);}
+.mxv-target-val{color:var(--primary-deep);border-bottom:1px dashed var(--primary-deep);min-height:32px;display:inline-flex;align-items:center;cursor:pointer;}
+.mxv-chip{padding:1px 6px;border-radius:8px;background:#f2f0f7;}
+.mxv-gap-bad{background:#e9f7ef;color:#2f8f5b;font-weight:600;}
+/* 套卷记录卡：题型总览表（只换表现形式，保留编辑/删除） */
+.xo-title{font-size:12px;font-weight:700;color:var(--text-sub);margin:12px 0 6px;}
+.xo-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px;}
+.xo-table th,.xo-table td{height:42px;padding:6px 4px;text-align:center;border-bottom:1px solid var(--border);box-sizing:border-box;}
+.xo-table th{background:#f4f2fa;color:var(--text-sub);font-weight:600;}
+.xo-table td:first-child,.xo-table th:first-child{text-align:left;padding-left:8px;}
+.xo-gap-good{background:#e9f7ef;color:#2f8f5b;font-weight:700;border-radius:5px;padding:2px 6px;}
+.xo-low{color:#d9534f;font-weight:700;}
+.xo-target-val{cursor:pointer;color:var(--primary-deep);border-bottom:1px dashed var(--primary-deep);min-height:32px;display:inline-flex;align-items:center;padding:3px 4px;}
+.xr-table td{padding:5px 3px;}
+.xr-name{max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;}
+.xr-date{color:var(--text-sub);white-space:nowrap;}
+.xr-ops{white-space:nowrap;}
+.xr-ops .btn{min-height:44px;padding:4px 8px;margin:0 2px;}
+
+/* 套卷明细表：手机竖卡 / 平板横表，按屏互斥显示 */
+.mx-mobile-only{display:none;}
+@media (max-width:600px){
+  .mx-desktop-only{display:none;}
+  .mx-mobile-only{display:block;}
+}
+.mx-table .mx-ops td{background:#fff;}
+.mx-table tr.mx-ops td.mx-ops-label{left:0;width:122px;min-width:122px;max-width:122px;text-align:left;padding-left:10px;font-size:11px;color:var(--text-sub);background:#faf9fd;}
+.mx-op-btn{min-height:34px;padding:0 7px;margin:0 2px;border:1px solid var(--border);background:#fff;border-radius:6px;font-size:11px;cursor:pointer;color:var(--primary-deep);}
+.mx-op-del{color:var(--danger);}
+.mxv-ops{display:flex;gap:8px;margin:10px 0 2px;}
+.mxv-ops .btn{flex:1;min-height:44px;}
+.mx-add-exam{min-height:36px;}
